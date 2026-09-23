@@ -1,0 +1,17 @@
+# PlatformIO build artefacts
+.pio/
+
+# Python helper scripts (not part of firmware)
+*.py
+
+# Backup / scratch files
+*.txt
+*.bak
+temp.cpp
+scratch_*.cpp
+
+# IDE / OS
+.vscode/
+.idea/
+*.DS_Store
+Thumbs.db
