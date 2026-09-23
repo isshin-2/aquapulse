@@ -481,9 +481,9 @@ bool forceRedraw = true;
 
 void setBrightness(int level) {
   brightnessLevel = constrain(level, 20, 255);
-  ledcSetup(0, 5000, 8);
-  ledcAttachPin(BL_PIN, 0);
-  ledcWrite(0, brightnessLevel);
+  ledcSetup(7, 5000, 8); // Move to channel 7 to avoid conflict with tone() on channel 0
+  ledcAttachPin(BL_PIN, 7);
+  ledcWrite(7, brightnessLevel);
 }
 
 void printMAC(const uint8_t *mac) {
