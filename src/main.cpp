@@ -873,10 +873,14 @@ void handleTouch() {
               currentMenuPage = 3;
               drawMenu();
             }
-            // BACK
+            // BACK — exit menu, full clean redraw
             else if (startY > 148 && startY < 186) {
               inMenu = false;
-              forceRedraw = true;
+              isPairingMode = false;
+              tft.fillScreen(COLOR_BG);
+              drawHeader();
+              drawDisplay(true);
+              forceRedraw = false;
             }
           }
           else if (currentMenuPage == 1) {
