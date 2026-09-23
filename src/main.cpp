@@ -388,6 +388,48 @@ WebServer server(80);
 bool isPairingMode = false;
 unsigned long pairingStartTime = 0;
 
+// ── Buzzer (pin 26, MMBT2222A NPN — HIGH = on) ───────────────────────────────
+#define BUZZER_PIN 26
+// Beep pattern state (non-blocking)
+bool     buzzerAlert   = false;   // true when at least one node is below threshold
+bool     buzzerOn      = false;   // current transistor state
+unsigned long buzzerLast = 0;
+int      buzzerPhase   = 0;       // cycles through ON/OFF timing
+
+// Call this from loop() — drives the buzzer without delay()
+void updateBuzzer() {
+  if (!buzzerAlert) {
+    if (buzzerOn) { digitalWrite(BUZZER_PIN, LOW); buzzerOn = false; }
+    buzzerPhase = 0;
+    return;
+  }
+  // Pattern: 100ms ON → 100ms OFF → 100ms ON → 700ms OFF (double-beep every ~1s)
+  static const uint16_t pattern[] = {100, 100, 100, 700};
+  unsigned long now = millis();
+  if (now - buzzerLast >= pattern[buzzerPhase]) {
+    buzzerLast = now;
+    buzzerPhase = (buzzerPhase + 1) % 4;
+    bool shouldBeOn = (buzzerPhase == 0 || buzzerPhase == 2); // phases 0,2 = ON
+    buzzerOn = shouldBeOn;
+    digitalWrite(BUZZER_PIN, buzzerOn ? HIGH : LOW);
+  }
+}
+
+// Check all nodes — update buzzerAlert flag
+void checkAlerts() {
+  bool anyAlert = false;
+  for (int i = 0; i < MAX_NODES; i++) {
+    if (!nodes[i].paired) continue;
+    if (millis() - nodes[i].lastRecvTime > 15000) continue; // skip offline
+    if (nodes[i].distance == -1) continue;
+    int pct = map(nodes[i].distance, tankEmptyMm, tankFullMm, 0, 100);
+    pct = constrain(pct, 0, 100);
+    if (pct < alertThreshold) { anyAlert = true; break; }
+  }
+  buzzerAlert = anyAlert;
+}
+
+
 // ── NVS (Preferences) for paired node MACs ───────────────────────────────────
 Preferences hubPrefs;
 
@@ -1364,6 +1406,9 @@ void setup() {
     nodes[i].lastRecvTime = 0;
   }
 
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+
   pinMode(17, OUTPUT);
   digitalWrite(17, HIGH);
   setBrightness(255);
@@ -1375,6 +1420,11 @@ void setup() {
   tft.setTouch(calData);
   
   tft.fillScreen(COLOR_BG);
+
+  // Short startup beep to confirm buzzer works
+  digitalWrite(BUZZER_PIN, HIGH);
+  delay(100);
+  digitalWrite(BUZZER_PIN, LOW);
 
   // ── AQUAPULSE Splash Animation ───────────────────────────────────────────
   // 1. Fade-in water rising from bottom
@@ -1463,6 +1513,7 @@ void loop() {
   ArduinoOTA.handle();
   server.handleClient();
   handleTouch();
+  updateBuzzer(); // non-blocking buzzer driver
 
   if (inMenu) {
     if (currentMenuPage == 2) {
@@ -1480,6 +1531,7 @@ void loop() {
 
   // Full page redraw only when data changed (ESP-NOW triggered forceRedraw)
   if (forceRedraw) {
+    checkAlerts();        // Evaluate if any node is below alertThreshold
     drawDisplay(false);   // false = don't nuke whole screen, just update dirty cells
     forceRedraw = false;
   }
@@ -1495,6 +1547,9 @@ void loop() {
     tft.setTextColor(COLOR_CYAN, COLOR_DARK_GRAY);
     tft.setCursor(268, 226);
     tft.print(buf);
+    
+    // Safety fallback: evaluate alerts on clock tick in case a node dropped offline
+    checkAlerts();
   }
 }
 #endif // HUB_RS485_SENSOR
