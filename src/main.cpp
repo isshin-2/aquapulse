@@ -399,7 +399,7 @@ int      buzzerPhase   = 0;       // cycles through ON/OFF timing
 // Call this from loop() — drives the buzzer without delay()
 void updateBuzzer() {
   if (!buzzerAlert) {
-    if (buzzerOn) { digitalWrite(BUZZER_PIN, LOW); buzzerOn = false; }
+    if (buzzerOn) { noTone(BUZZER_PIN); digitalWrite(BUZZER_PIN, LOW); buzzerOn = false; }
     buzzerPhase = 0;
     return;
   }
@@ -410,8 +410,13 @@ void updateBuzzer() {
     buzzerLast = now;
     buzzerPhase = (buzzerPhase + 1) % 4;
     bool shouldBeOn = (buzzerPhase == 0 || buzzerPhase == 2); // phases 0,2 = ON
+    if (shouldBeOn && !buzzerOn) {
+      tone(BUZZER_PIN, 2500); // 2.5kHz square wave for passive buzzer
+    } else if (!shouldBeOn && buzzerOn) {
+      noTone(BUZZER_PIN);
+      digitalWrite(BUZZER_PIN, LOW);
+    }
     buzzerOn = shouldBeOn;
-    digitalWrite(BUZZER_PIN, buzzerOn ? HIGH : LOW);
   }
 }
 
@@ -1079,8 +1084,9 @@ void handleTouch() {
               tft.setCursor(95, 66);
               tft.print("TEST BUZZER");
               
-              digitalWrite(BUZZER_PIN, HIGH);
+              tone(BUZZER_PIN, 2500);
               delay(500); // Test beep
+              noTone(BUZZER_PIN);
               digitalWrite(BUZZER_PIN, LOW);
               
               drawMenu(); // restore original button color
@@ -1490,8 +1496,9 @@ void setup() {
   tft.fillScreen(COLOR_BG);
 
   // Short startup beep to confirm buzzer works
-  digitalWrite(BUZZER_PIN, HIGH);
+  tone(BUZZER_PIN, 2500);
   delay(100);
+  noTone(BUZZER_PIN);
   digitalWrite(BUZZER_PIN, LOW);
 
   // ── AQUAPULSE Splash Animation ───────────────────────────────────────────
