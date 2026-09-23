@@ -151,13 +151,16 @@ bool readSensorDistance(uint16_t &distanceMm) {
   return false;
 }
 // ── Calibration / Filtering ─────────────────────────────────────────────────
-#define MEDIAN_SAMPLES  5      // how many raw reads to median-filter
-#define EMA_ALPHA_NUM   3      // EMA weight numerator   (weight = 3/10 = 0.3)
-#define EMA_ALPHA_DEN   10     // EMA weight denominator
-#define DEADBAND_MM     8      // don't transmit unless reading changed by >8mm
+#define MEDIAN_SAMPLES   7      // 7 pings per cycle — better outlier rejection
+#define EMA_ALPHA_NUM    15     // EMA weight = 15/100 = 0.15 — very slow to drift
+#define EMA_ALPHA_DEN    100
+#define DEADBAND_MM      10     // suppress transmit unless changed by >10mm
+#define PLAUSIBLE_JUMP   200    // reject any reading >200mm from current EMA (spike guard)
+#define SENSOR_MIN_MM    20     // DYP-A02YYTW min range
+#define SENSOR_MAX_MM    4500   // DYP-A02YYTW max range
 
-int16_t emaValue = -1;         // running EMA, -1 = not initialised
-int16_t lastSentMm = -1;       // last value actually transmitted
+int16_t emaValue  = -1;
+int16_t lastSentMm = -1;
 
 // Take one raw reading from the DYP sensor (blocking ~60ms)
 bool readRaw(uint16_t &out) {
@@ -172,8 +175,12 @@ bool readRaw(uint16_t &out) {
       d[2] = dypSerial.read();
       d[3] = dypSerial.read();
       if (((d[0]+d[1]+d[2]) & 0xFF) == d[3]) {
-        out = (d[1] << 8) | d[2];
-        return true;
+        uint16_t v = (d[1] << 8) | d[2];
+        // Hard clamp to sensor physical range
+        if (v >= SENSOR_MIN_MM && v <= SENSOR_MAX_MM) {
+          out = v;
+          return true;
+        }
       }
     }
   }
@@ -189,7 +196,7 @@ void sortArr(uint16_t *a, int n) {
   }
 }
 
-// Read MEDIAN_SAMPLES, return median; returns false if fewer than 3 valid reads
+// Take MEDIAN_SAMPLES readings, return median; false if < 4 valid
 bool readMedian(uint16_t &out) {
   uint16_t buf[MEDIAN_SAMPLES];
   int valid = 0;
@@ -197,11 +204,12 @@ bool readMedian(uint16_t &out) {
     uint16_t v;
     if (readRaw(v)) buf[valid++] = v;
   }
-  if (valid < 3) return false;
+  if (valid < 4) return false;
   sortArr(buf, valid);
   out = buf[valid / 2];
   return true;
 }
+
 
 void setup() {
   Serial.begin(115200);
@@ -254,31 +262,40 @@ void loop() {
   if (paired) {
     uint16_t median;
     if (readMedian(median)) {
-      // Apply EMA: new = (alpha * median) + ((1-alpha) * old)
-      if (emaValue < 0) emaValue = median; // seed on first valid read
-      emaValue = (EMA_ALPHA_NUM * (int)median + (EMA_ALPHA_DEN - EMA_ALPHA_NUM) * (int)emaValue) / EMA_ALPHA_DEN;
+      // Seed EMA on first reading
+      if (emaValue < 0) emaValue = (int16_t)median;
 
-      // Only transmit if changed by more than DEADBAND_MM
-      if (lastSentMm < 0 || abs((int)emaValue - (int)lastSentMm) > DEADBAND_MM) {
-        SensorData data;
-        data.deviceId  = myDeviceId;
-        data.distance  = emaValue;
-        data.timestamp = millis();
-        esp_err_t result = esp_now_send(hubMAC, (uint8_t *)&data, sizeof(SensorData));
-        if (result == ESP_OK) {
-          sendFailures = 0;
-          lastSentMm = emaValue;
-          Serial.printf("[NODE] Dist: %d mm  (raw median=%d mm)\n", emaValue, median);
-        } else {
-          sendFailures++;
-          Serial.printf("[NODE] Send fail #%d\n", sendFailures);
-        }
+      // Plausibility check: if this median is >PLAUSIBLE_JUMP from our running EMA,
+      // it's almost certainly a spurious echo — discard it entirely
+      if (abs((int)median - (int)emaValue) > PLAUSIBLE_JUMP) {
+        Serial.printf("[NODE] SPIKE rejected: median=%d  EMA=%d\n", median, emaValue);
       } else {
-        Serial.printf("[NODE] Stable (%d mm, no tx)\n", emaValue);
+        // Apply EMA: new = alpha*median + (1-alpha)*old
+        emaValue = (EMA_ALPHA_NUM * (int)median + (EMA_ALPHA_DEN - EMA_ALPHA_NUM) * (int)emaValue) / EMA_ALPHA_DEN;
+
+        // Only transmit if changed by more than DEADBAND_MM
+        if (lastSentMm < 0 || abs((int)emaValue - (int)lastSentMm) > DEADBAND_MM) {
+          SensorData data;
+          data.deviceId  = myDeviceId;
+          data.distance  = emaValue;
+          data.timestamp = millis();
+          esp_err_t result = esp_now_send(hubMAC, (uint8_t *)&data, sizeof(SensorData));
+          if (result == ESP_OK) {
+            sendFailures = 0;
+            lastSentMm = emaValue;
+            Serial.printf("[NODE] Dist: %d mm  (raw median=%d mm)\n", emaValue, median);
+          } else {
+            sendFailures++;
+            Serial.printf("[NODE] Send fail #%d\n", sendFailures);
+          }
+        } else {
+          Serial.printf("[NODE] Stable (%d mm, no tx)\n", emaValue);
+        }
       }
     } else {
       Serial.println("[NODE] Sensor read failed");
     }
+
 
     // After 10 consecutive failures, assume hub changed — clear NVS and re-scan
     if (sendFailures >= 10) {
