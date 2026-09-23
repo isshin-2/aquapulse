@@ -205,7 +205,7 @@ bool readMedian(uint16_t &out) {
 
 void setup() {
   Serial.begin(115200);
-  while (!Serial) { delay(10); }
+  delay(500); // brief settle — do NOT block on Serial (no USB = infinite hang)
 
   Serial.println("\n--- AQUAPULSE Node ---");
   dypSerial.begin(9600, SERIAL_8N1, DYP_RX, DYP_TX);
@@ -217,16 +217,27 @@ void setup() {
   Serial.print("[NODE] MAC: "); printMAC(myMAC); Serial.println();
 
   if (esp_now_init() != ESP_OK) {
-    Serial.println("[NODE] ESP-NOW init failed"); return;
+    Serial.println("[NODE] ESP-NOW init failed — restarting");
+    delay(1000); ESP.restart(); return;
   }
   esp_now_register_send_cb(OnDataSent);
   esp_now_register_recv_cb(OnDataRecv);
+
+  // Add broadcast peer so hub beacons (sent to FF:FF:...) are receivable
+  // and so we can reply from any address during pairing
+  uint8_t broadcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+  if (!esp_now_is_peer_exist(broadcast)) {
+    esp_now_peer_info_t bcast = {};
+    memset(bcast.peer_addr, 0xFF, 6);
+    bcast.channel = PAIRING_CHANNEL;
+    bcast.encrypt = false;
+    esp_now_add_peer(&bcast);
+  }
 
   // Load saved pairing from NVS
   nodeLoadNVS();
   if (paired) {
     Serial.print("[NODE] Restored pairing — Hub: "); printMAC(hubMAC); Serial.println();
-    // Re-register hub as peer so we can send immediately
     if (!esp_now_is_peer_exist(hubMAC)) {
       esp_now_peer_info_t peerInfo = {};
       memcpy(peerInfo.peer_addr, hubMAC, 6);
@@ -235,7 +246,7 @@ void setup() {
       esp_now_add_peer(&peerInfo);
     }
   } else {
-    Serial.println("[NODE] No saved pairing — waiting for Hub beacon...");
+    Serial.println("[NODE] No saved pairing — scanning for Hub beacon...");
   }
 }
 
