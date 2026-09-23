@@ -1324,25 +1324,27 @@ void drawStatusBar(bool fullRedraw) {
     tft.setCursor(10, 222);
     if (currentPage == 0) tft.print("o .");
     else tft.print(". o");
-  
-    tft.setCursor(100, 222);
-    tft.print("Nodes: ");
+    tft.setCursor(90, 222);
+    tft.print("Nodes:");
   }
 
-  int pCount = 0;
-  for (int i = 0; i < activeNodeCount(); i++) if (nodes[i].paired) pCount++;
-    
+  // Node count
+  int pCount = activeNodeCount();
   tft.setTextSize(2);
   tft.setTextColor(COLOR_ACCENT, COLOR_DARK_GRAY);
   tft.setCursor(175, 222);
-  tft.print(pCount);
-  
+  char nc[4]; sprintf(nc, "%d ", pCount);
+  tft.print(nc);
+
+  // Clock — textSize=1: each char=6px, "HH:MM:SS"=48px, x=268..316 (inside 320)
   unsigned long upSec = (millis() - startTime) / 1000;
-  tft.setTextColor(COLOR_CYAN, COLOR_DARK_GRAY);
-  tft.setCursor(240, 222);
   char buf[12];
   sprintf(buf, "%02lu:%02lu:%02lu", upSec/3600, (upSec%3600)/60, upSec%60);
+  tft.setTextSize(1);
+  tft.setTextColor(COLOR_CYAN, COLOR_DARK_GRAY);
+  tft.setCursor(268, 226);
   tft.print(buf);
+
 }
 
 void drawDisplay(bool fullRedraw) {
@@ -1482,17 +1484,16 @@ void loop() {
     forceRedraw = false;
   }
 
-  // Clock in status bar ticks every second — only repaint the time text, no flicker
+  // Clock ticks every second — textSize=1, x=268..316, safely inside 320px
   static unsigned long lastClockTick = 0;
   if (millis() - lastClockTick > 1000) {
     lastClockTick = millis();
-    // Repaint uptime digits only (no fillRect on surrounding area)
     unsigned long upSec = (millis() - startTime) / 1000;
     char buf[12];
     sprintf(buf, "%02lu:%02lu:%02lu", upSec/3600, (upSec%3600)/60, upSec%60);
-    tft.setTextSize(2);
-    tft.setTextColor(COLOR_CYAN, COLOR_DARK_GRAY); // bg=COLOR_DARK_GRAY erases old digits inline
-    tft.setCursor(240, 222);
+    tft.setTextSize(1);
+    tft.setTextColor(COLOR_CYAN, COLOR_DARK_GRAY);
+    tft.setCursor(268, 226);
     tft.print(buf);
   }
 }
