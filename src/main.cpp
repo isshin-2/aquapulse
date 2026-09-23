@@ -847,6 +847,40 @@ void drawMenu() {
     tft.setCursor(134, 194);
     tft.print("BACK");
   }
+
+  // ── Page 99: Secret Menu ──────────────────────────────────────────────────
+  if (currentMenuPage == 99) {
+    tft.fillRect(0, 0, 320, 24, COLOR_DARK_GRAY);
+    tft.setTextColor(COLOR_CYAN);
+    tft.setTextSize(2);
+    tft.setCursor(6, 4);
+    tft.print("SECRET MENU");
+
+    // BUZZER TEST BUTTON
+    tft.fillRoundRect(8, 50, 304, 50, 6, COLOR_ORANGE);
+    tft.setTextColor(COLOR_WHITE);
+    tft.setTextSize(2);
+    tft.setCursor(95, 66);
+    tft.print("TEST BUZZER");
+
+    // System Info
+    tft.setTextColor(COLOR_WHITE);
+    tft.setTextSize(1);
+    tft.setCursor(10, 115);
+    tft.print("Hub MAC: "); 
+    char macStr[20];
+    sprintf(macStr, "%02X:%02X:%02X:%02X:%02X:%02X", myMAC[0], myMAC[1], myMAC[2], myMAC[3], myMAC[4], myMAC[5]);
+    tft.print(macStr);
+    tft.setCursor(10, 130);
+    tft.print("Uptime (s): "); tft.print(millis()/1000);
+
+    // BACK button
+    tft.fillRoundRect(8, 160, 304, 38, 6, COLOR_BLUE);
+    tft.setTextColor(COLOR_WHITE);
+    tft.setTextSize(2);
+    tft.setCursor(134, 172);
+    tft.print("BACK");
+  }
 }
 
 void handleTouch() {
@@ -897,6 +931,18 @@ void handleTouch() {
             inMenu = true;
             currentMenuPage = 0;
             drawMenu();
+          }
+          // Secret menu (double tap on logo x=0..150, y=0..32)
+          else if (startX < 150 && startY < 32) {
+            static unsigned long lastTap = 0;
+            if (millis() - lastTap < 500 && lastTap > 0) {
+              inMenu = true;
+              currentMenuPage = 99; // Secret Menu
+              drawMenu();
+              lastTap = 0;
+            } else {
+              lastTap = millis();
+            }
           }
         } else {
           if (currentMenuPage == 0) {
@@ -1019,6 +1065,19 @@ void handleTouch() {
             }
             // BACK y=186..220
             if (startY > 186 && startY < 220) {
+              currentMenuPage = 0;
+              drawMenu();
+            }
+          }
+          else if (currentMenuPage == 99) {
+            // TEST BUZZER (y=50..100)
+            if (startY > 50 && startY < 100) {
+              digitalWrite(BUZZER_PIN, HIGH);
+              delay(500); // Test beep
+              digitalWrite(BUZZER_PIN, LOW);
+            }
+            // BACK (y=160..198)
+            else if (startY > 160 && startY < 198) {
               currentMenuPage = 0;
               drawMenu();
             }
