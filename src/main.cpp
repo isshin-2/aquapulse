@@ -1455,11 +1455,24 @@ void loop() {
     return;
   }
 
-  static unsigned long lastUiUpdate = 0;
-  if (forceRedraw || millis() - lastUiUpdate > 1000) {
-    lastUiUpdate = millis();
-    drawDisplay(forceRedraw);
+  // Full page redraw only when data changed (ESP-NOW triggered forceRedraw)
+  if (forceRedraw) {
+    drawDisplay(false);   // false = don't nuke whole screen, just update dirty cells
     forceRedraw = false;
+  }
+
+  // Clock in status bar ticks every second — only repaint the time text, no flicker
+  static unsigned long lastClockTick = 0;
+  if (millis() - lastClockTick > 1000) {
+    lastClockTick = millis();
+    // Repaint uptime digits only (no fillRect on surrounding area)
+    unsigned long upSec = (millis() - startTime) / 1000;
+    char buf[12];
+    sprintf(buf, "%02lu:%02lu:%02lu", upSec/3600, (upSec%3600)/60, upSec%60);
+    tft.setTextSize(2);
+    tft.setTextColor(COLOR_CYAN, COLOR_DARK_GRAY); // bg=COLOR_DARK_GRAY erases old digits inline
+    tft.setCursor(240, 222);
+    tft.print(buf);
   }
 }
 #endif // HUB_RS485_SENSOR
