@@ -933,9 +933,9 @@ void handleTouch() {
             drawMenu();
           }
           // Secret menu (double tap on logo x=0..150, y=0..32)
-          else if (startX < 150 && startY < 32) {
+          else if (startX < 180 && startY < 40) {
             static unsigned long lastTap = 0;
-            if (millis() - lastTap < 500 && lastTap > 0) {
+            if (millis() - lastTap < 1000 && lastTap > 0) {
               inMenu = true;
               currentMenuPage = 99; // Secret Menu
               drawMenu();
@@ -1072,9 +1072,18 @@ void handleTouch() {
           else if (currentMenuPage == 99) {
             // TEST BUZZER (y=50..100)
             if (startY > 50 && startY < 100) {
+              // Visual feedback: button turns red
+              tft.fillRoundRect(8, 50, 304, 50, 6, COLOR_RED);
+              tft.setTextColor(COLOR_WHITE);
+              tft.setTextSize(2);
+              tft.setCursor(95, 66);
+              tft.print("TEST BUZZER");
+              
               digitalWrite(BUZZER_PIN, HIGH);
               delay(500); // Test beep
               digitalWrite(BUZZER_PIN, LOW);
+              
+              drawMenu(); // restore original button color
             }
             // BACK (y=160..198)
             else if (startY > 160 && startY < 198) {
