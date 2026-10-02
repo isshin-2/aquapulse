@@ -10,11 +10,34 @@ typedef struct __attribute__((packed)) {
     unsigned long timestamp;
 } SensorData;
 
+// Shared secret for pairing authentication (must match on hub and node)
+// XOR-HMAC: auth = XOR of all bytes in packet ^ key bytes (cycling)
+static const uint8_t PAIR_KEY[8] = {0xA5, 0x2B, 0x7C, 0x4D, 0x71, 0x3A, 0xF2, 0x9B};
+// Note: resolved at compile time to:
+#define PAIR_KEY_0 0xA5
+#define PAIR_KEY_1 0x2B
+#define PAIR_KEY_2 0x7C
+#define PAIR_KEY_3 0x4D
+#define PAIR_KEY_4 0x71
+#define PAIR_KEY_5 0x3A
+#define PAIR_KEY_6 0xF2
+#define PAIR_KEY_7 0x9B
+
+// Compute 4-byte auth tag: XOR of packet bytes with cycling key
+static uint32_t pairAuth(const uint8_t *data, int len) {
+  static const uint8_t K[8] = {PAIR_KEY_0,PAIR_KEY_1,PAIR_KEY_2,PAIR_KEY_3,
+                                PAIR_KEY_4,PAIR_KEY_5,PAIR_KEY_6,PAIR_KEY_7};
+  uint32_t acc = 0x55AA55AA;
+  for (int i = 0; i < len; i++) acc = ((acc << 5) | (acc >> 27)) ^ (data[i] * K[i & 7]);
+  return acc;
+}
+
 typedef struct __attribute__((packed)) {
     char magic[8];
     uint8_t hubMAC[6];
     uint8_t channel;
     uint16_t pairingCode;
+    uint32_t auth;        // pairAuth of all above fields
 } PairingBeacon;
 
 typedef struct __attribute__((packed)) {
@@ -22,6 +45,7 @@ typedef struct __attribute__((packed)) {
     uint8_t sensorMAC[6];
     uint8_t deviceId;
     uint16_t pairingCode;
+    uint32_t auth;        // pairAuth of all above fields
 } PairingRequest;
 
 typedef struct __attribute__((packed)) {
@@ -29,6 +53,7 @@ typedef struct __attribute__((packed)) {
     uint8_t hubMAC[6];
     uint8_t deviceId;
     bool accepted;
+    uint32_t auth;        // pairAuth of all above fields
 } PairingConfirm;
 
 #ifdef NODE_DYP_SENSOR
@@ -38,12 +63,16 @@ typedef struct __attribute__((packed)) {
 #include <HardwareSerial.h>
 #include <Preferences.h>
 
-#define DYP_RX D2
+// User confirmed connections:
+// ESP32 TX: D1 (GPIO 3), connects to Sensor RX (White)
+// ESP32 RX: D2 (GPIO 4), connects to Sensor TX (Yellow)
 #define DYP_TX D1
+#define DYP_RX D2
 HardwareSerial dypSerial(1);
 
 uint8_t hubMAC[6];
 bool paired = false;
+uint8_t currentChan = 1;
 uint16_t pairingCode = 0;
 uint8_t myDeviceId = 1; 
 uint8_t myMAC[6];
@@ -53,12 +82,15 @@ unsigned char dypData[4] = {};
 int sendFailures = 0;          // consecutive send failures
 Preferences nodePrefs;
 
+void nodeClearNVS();
 void nodeLoadNVS() {
   nodePrefs.begin("node", true); // read-only
   paired = nodePrefs.getBool("paired", false);
+  // Removed forced wipe
   if (paired) {
     nodePrefs.getBytes("hubMAC", hubMAC, 6);
     pairingCode = nodePrefs.getUShort("code", 0);
+    currentChan = nodePrefs.getUChar("chan", 1);
   }
   nodePrefs.end();
 }
@@ -68,6 +100,7 @@ void nodeSaveNVS() {
   nodePrefs.putBool("paired", paired);
   nodePrefs.putBytes("hubMAC", hubMAC, 6);
   nodePrefs.putUShort("code", pairingCode);
+  nodePrefs.putUChar("chan", currentChan);
   nodePrefs.end();
 }
 
@@ -86,138 +119,272 @@ void printMAC(const uint8_t *mac) {
   Serial.print(buf);
 }
 
+extern int16_t lastSentMm;
 void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+  bool ok = (status == ESP_NOW_SEND_SUCCESS);
   Serial.print("[NODE] Send Status: ");
-  Serial.println(status == ESP_NOW_SEND_SUCCESS ? "Success" : "Fail");
+  Serial.println(ok ? "Success" : "Fail");
+  if (ok) {
+    sendFailures = 0;
+  } else {
+    lastSentMm = -1; // Force retry on next cycle
+  }
+}
+
+// Track pending hub info when re-pairing (don't overwrite live hub until confirmed)
+uint8_t pendingHubMAC[6] = {};
+uint16_t pendingCode = 0;
+bool waitingForConfirm = false;
+unsigned long lastBeaconRecvTime = 0;
+
+void sendPairingRequest(const uint8_t *targetMAC, uint16_t code) {
+  // Register hub as peer if needed
+  if (!esp_now_is_peer_exist(targetMAC)) {
+    esp_now_peer_info_t p = {};
+    memcpy(p.peer_addr, targetMAC, 6);
+    p.channel = PAIRING_CHANNEL;
+    p.encrypt = false;
+    esp_now_add_peer(&p);
+  }
+  PairingRequest req = {};
+  strncpy(req.magic, "WLMSREQ", 8);
+  memcpy(req.sensorMAC, myMAC, 6);
+  req.deviceId = myDeviceId;
+  req.pairingCode = code;
+  req.auth = pairAuth((uint8_t*)&req, sizeof(req) - sizeof(req.auth));
+  esp_now_send(targetMAC, (uint8_t *)&req, sizeof(PairingRequest));
+  Serial.println("[NODE] Pairing request sent");
 }
 
 void OnDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
-  if (paired) return; // Ignore if already paired
-
+  // ── Hub Beacon (broadcast) ──
   if (len == sizeof(PairingBeacon)) {
-    PairingBeacon *beacon = (PairingBeacon *)incomingData;
-    if (strncmp(beacon->magic, "WLMSHUB", 8) == 0) {
-      Serial.println("[NODE] Found Hub Beacon — sending pairing request");
-      memcpy(hubMAC, beacon->hubMAC, 6);
-      pairingCode = beacon->pairingCode;
-      
-      if (!esp_now_is_peer_exist(hubMAC)) {
-        esp_now_peer_info_t peerInfo = {};
-        memcpy(peerInfo.peer_addr, hubMAC, 6);
-        peerInfo.channel = PAIRING_CHANNEL;
-        peerInfo.encrypt = false;
-        esp_now_add_peer(&peerInfo);
-      }
-
-      PairingRequest req;
-      strncpy(req.magic, "WLMSREQ", 8);
-      memcpy(req.sensorMAC, myMAC, 6);
-      req.deviceId = myDeviceId;
-      req.pairingCode = pairingCode;
-      esp_now_send(hubMAC, (uint8_t *)&req, sizeof(PairingRequest));
+    PairingBeacon *b = (PairingBeacon *)incomingData;
+    if (strncmp(b->magic, "WLMSHUB", 8) != 0) return;
+    Serial.println("[NODE] RX: Received WLMSHUB (PairingBeacon)");
+    // Validate auth
+    uint32_t expected = pairAuth((uint8_t*)b, sizeof(PairingBeacon) - sizeof(b->auth));
+    if (b->auth != expected) {
+      Serial.println("[NODE] Beacon auth FAIL - ignoring");
+      return;
     }
-  } else if (len == sizeof(PairingConfirm)) {
+    lastBeaconRecvTime = millis();
+    // Lock onto hub channel from beacon
+    uint8_t hubChan = b->channel > 0 && b->channel <= 13 ? b->channel : PAIRING_CHANNEL;
+    if (currentChan != hubChan) {
+      currentChan = hubChan;
+      esp_wifi_set_channel(currentChan, WIFI_SECOND_CHAN_NONE);
+      // Re-register broadcast peer on new channel
+      uint8_t bcastMac[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+      esp_now_del_peer(bcastMac);
+      esp_now_peer_info_t bcast = {};
+      memset(bcast.peer_addr, 0xFF, 6);
+      bcast.channel = currentChan;
+      bcast.encrypt = false;
+      esp_now_add_peer(&bcast);
+    }
+    if (paired) {
+      // Already paired - only respond if it's the SAME hub (allow re-pairing after hub restart)
+      if (memcmp(b->hubMAC, hubMAC, 6) != 0) {
+        Serial.println("[NODE] Beacon from different hub - ignoring (already paired)");
+        return;
+      }
+      Serial.println("[NODE] Hub beacon from known hub - re-announcing");
+    } else {
+      Serial.println("[NODE] Hub beacon received - responding");
+    }
+    memcpy(pendingHubMAC, b->hubMAC, 6);
+    pendingCode = b->pairingCode;
+    waitingForConfirm = true;
+    sendPairingRequest(b->hubMAC, b->pairingCode);
+  }
+  // ── Pairing Confirm ──
+  else if (len == sizeof(PairingConfirm)) {
     PairingConfirm *conf = (PairingConfirm *)incomingData;
-    if (strncmp(conf->magic, "WLMSCONF", 8) == 0 && conf->deviceId == myDeviceId) {
-      if (conf->accepted) {
-        paired = true;
-        nodeSaveNVS(); // ← persist hub MAC so next boot skips scanning
-        Serial.println("[NODE] Paired! Saved to NVS.");
+    if (strncmp(conf->magic, "WLMSCONF", 8) != 0) return;
+    Serial.println("[NODE] RX: Received WLMSCONF (PairingConfirm)");
+    // Validate auth
+    uint32_t expected = pairAuth((uint8_t*)conf, sizeof(PairingConfirm) - sizeof(conf->auth));
+    if (conf->auth != expected) {
+      Serial.println("[NODE] Confirm auth FAIL - ignoring");
+      return;
+    }
+    if (paired && conf->deviceId != myDeviceId) return; // Only check if already paired
+    if (conf->accepted) {
+      memcpy(hubMAC, conf->hubMAC, 6);
+      paired = true;
+      waitingForConfirm = false;
+      myDeviceId = conf->deviceId;
+      // Register hub peer for data sends
+      if (!esp_now_is_peer_exist(hubMAC)) {
+        esp_now_peer_info_t p = {};
+        memcpy(p.peer_addr, hubMAC, 6);
+        p.channel = currentChan;
+        p.encrypt = false;
+        esp_now_add_peer(&p);
       } else {
-        Serial.println("[NODE] Pairing rejected.");
+        // Update channel
+        esp_now_peer_info_t p = {};
+        memcpy(p.peer_addr, hubMAC, 6);
+        esp_now_get_peer(hubMAC, &p);
+        p.channel = currentChan;
+        esp_now_mod_peer(&p);
       }
+      nodeSaveNVS();
+      Serial.println("[NODE] Paired! Saved to NVS.");
+    } else {
+      waitingForConfirm = false;
+      Serial.println("[NODE] Pairing rejected.");
     }
   }
 }
 
-bool readSensorDistance(uint16_t &distanceMm) {
-  dypSerial.write(0x55);
-  delay(50);
-  
-  if (dypSerial.available() >= 4) {
-    dypData[0] = dypSerial.read();
-    if (dypData[0] == 0xFF) {
-      dypData[1] = dypSerial.read();
-      dypData[2] = dypSerial.read();
-      dypData[3] = dypSerial.read();
-      
-      uint8_t sum = (dypData[0] + dypData[1] + dypData[2]) & 0xFF;
-      if (sum == dypData[3]) {
-        distanceMm = (dypData[1] << 8) | dypData[2];
-        return true;
-      }
-    }
-  }
-  return false;
-}
 // ── Calibration / Filtering ─────────────────────────────────────────────────
-#define MEDIAN_SAMPLES   7      // 7 pings per cycle — better outlier rejection
-#define EMA_ALPHA_NUM    15     // EMA weight = 15/100 = 0.15 — very slow to drift
+#define MEDIAN_SAMPLES   5      // 5 pings per cycle
+#define EMA_ALPHA_NUM    25     // EMA weight = 25/100 (responsive yet smooth)
 #define EMA_ALPHA_DEN    100
 #define DEADBAND_MM      10     // suppress transmit unless changed by >10mm
-#define PLAUSIBLE_JUMP   200    // reject any reading >200mm from current EMA (spike guard)
-#define SENSOR_MIN_MM    20     // DYP-A02YYTW min range
-#define SENSOR_MAX_MM    4500   // DYP-A02YYTW max range
+#define PLAUSIBLE_JUMP   300    // outlier threshold (mm)
+#define MAX_CONSECUTIVE_SPIKES 3 // accept step change after 3 consecutive readings
+#define SENSOR_MIN_MM    25     // DYP-A02 min range
+#define SENSOR_MAX_MM    4500   // DYP-A02 max range
+#define HEARTBEAT_MS     2000   // Periodic heartbeat interval (ms)
 
-int16_t emaValue  = -1;
+int16_t emaValue   = -1;
 int16_t lastSentMm = -1;
+int consecutiveSpikes = 0;
 
-// Take one raw reading from the DYP sensor (blocking ~60ms)
+int pinComb = 0; // 0: RX=D2, TX=D1. 1: RX=D1, TX=D2.
+bool pinLocked = false;
+int zeroCycles = 0;
+
+void initSensorPins(int comb) {
+  dypSerial.end();
+  delay(15);
+  if (comb == 0) {
+    dypSerial.begin(9600, SERIAL_8N1, D2, D1);
+    pinMode(D2, INPUT_PULLUP);
+    Serial.println("[NODE] Sensor UART: RX=D2, TX=D1 (9600 8N1)");
+  } else {
+    dypSerial.begin(9600, SERIAL_8N1, D1, D2);
+    pinMode(D1, INPUT_PULLUP);
+    Serial.println("[NODE] Sensor UART: RX=D1, TX=D2 (9600 8N1)");
+  }
+}
+
+// Clean, robust reading of 1 sample from the DYP sensor via UART
 bool readRaw(uint16_t &out) {
-  while (dypSerial.available()) dypSerial.read(); // flush stale bytes
-  dypSerial.write(0x55);
-  delay(60);
+  // 1. Check if sensor auto-outputted 4+ bytes (Auto Mode)
   if (dypSerial.available() >= 4) {
-    uint8_t d[4];
-    d[0] = dypSerial.read();
-    if (d[0] == 0xFF) {
-      d[1] = dypSerial.read();
-      d[2] = dypSerial.read();
-      d[3] = dypSerial.read();
-      if (((d[0]+d[1]+d[2]) & 0xFF) == d[3]) {
-        uint16_t v = (d[1] << 8) | d[2];
-        // Hard clamp to sensor physical range
-        if (v >= SENSOR_MIN_MM && v <= SENSOR_MAX_MM) {
-          out = v;
-          return true;
+    uint8_t d[32];
+    int n = min((int)dypSerial.available(), 32);
+    for (int i = 0; i < n; i++) d[i] = dypSerial.read();
+    for (int i = 0; i <= n - 4; i++) {
+      if (d[i] == 0xFF) {
+        uint8_t sum = (d[i] + d[i+1] + d[i+2]) & 0xFF;
+        if (sum == d[i+3]) {
+          uint16_t v = ((uint16_t)d[i+1] << 8) | d[i+2];
+          if (v >= SENSOR_MIN_MM && v <= SENSOR_MAX_MM) {
+            out = v;
+            return true;
+          }
         }
       }
     }
   }
+
+  // 2. Clear stale bytes before sending trigger
+  while (dypSerial.available()) dypSerial.read();
+
+  // 3. Send trigger 0x55 (UART Controlled mode)
+  dypSerial.write(0x55);
+
+  // 4. Poll for up to 90ms for 4 bytes
+  unsigned long t0 = millis();
+  while (dypSerial.available() < 4 && (millis() - t0 < 90)) {
+    delay(2);
+  }
+
+  int avail = dypSerial.available();
+  if (avail >= 4) {
+    uint8_t d[32];
+    int n = min(avail, 32);
+    for (int i = 0; i < n; i++) d[i] = dypSerial.read();
+    for (int i = 0; i <= n - 4; i++) {
+      if (d[i] == 0xFF) {
+        uint8_t sum = (d[i] + d[i+1] + d[i+2]) & 0xFF;
+        if (sum == d[i+3]) {
+          uint16_t v = ((uint16_t)d[i+1] << 8) | d[i+2];
+          if (v >= SENSOR_MIN_MM && v <= SENSOR_MAX_MM) {
+            out = v;
+            return true;
+          }
+        }
+      }
+    }
+    Serial.printf("[NODE] DYP data no valid checksum (got %d bytes): ", n);
+    for (int i = 0; i < n; i++) Serial.printf("0x%02X ", d[i]);
+    Serial.println();
+  }
   return false;
 }
 
-// Insertion-sort helper for median
 void sortArr(uint16_t *a, int n) {
   for (int i = 1; i < n; i++) {
-    uint16_t key = a[i]; int j = i-1;
-    while (j >= 0 && a[j] > key) { a[j+1] = a[j]; j--; }
-    a[j+1] = key;
+    uint16_t key = a[i]; int j = i - 1;
+    while (j >= 0 && a[j] > key) { a[j + 1] = a[j]; j--; }
+    a[j + 1] = key;
   }
 }
 
-// Take MEDIAN_SAMPLES readings, return median; false if < 4 valid
+// Take MEDIAN_SAMPLES readings, return median
 bool readMedian(uint16_t &out) {
   uint16_t buf[MEDIAN_SAMPLES];
   int valid = 0;
   for (int i = 0; i < MEDIAN_SAMPLES; i++) {
     uint16_t v;
-    if (readRaw(v)) buf[valid++] = v;
+    if (readRaw(v)) {
+      buf[valid++] = v;
+    }
+    delay(15);
   }
-  if (valid < 4) return false;
-  sortArr(buf, valid);
-  out = buf[valid / 2];
-  return true;
+  if (valid > 0) {
+    if (!pinLocked) {
+      pinLocked = true;
+      Serial.printf("[NODE] DYP Sensor LOCKED on %s!\n", pinComb == 0 ? "RX=D2, TX=D1" : "RX=D1, TX=D2");
+    }
+    zeroCycles = 0;
+    if (valid == 1) {
+      out = buf[0];
+      return true;
+    }
+    sortArr(buf, valid);
+    out = buf[valid / 2];
+    return true;
+  }
+  
+  if (!pinLocked) {
+    zeroCycles++;
+    if (zeroCycles >= 6) { // After 6 failed cycles (~3.5 sec), try other pin combo
+      zeroCycles = 0;
+      pinComb = 1 - pinComb;
+      initSensorPins(pinComb);
+      Serial.printf("[NODE-PINS] Levels: D1(gpio%d)=%d D2(gpio%d)=%d\n",
+                    D1, gpio_get_level((gpio_num_t)D1), D2, gpio_get_level((gpio_num_t)D2));
+    }
+  }
+  return false;
 }
-
 
 void setup() {
   Serial.begin(115200);
   delay(500); // brief settle — do NOT block on Serial (no USB = infinite hang)
 
   Serial.println("\n--- AQUAPULSE Node ---");
-  dypSerial.begin(9600, SERIAL_8N1, DYP_RX, DYP_TX);
+  initSensorPins(0); // Start with user confirmed default: RX=D2, TX=D1
 
+  // Always start on PAIRING_CHANNEL so hub can find us immediately
+  currentChan = PAIRING_CHANNEL;
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
   esp_wifi_set_channel(PAIRING_CHANNEL, WIFI_SECOND_CHAN_NONE);
@@ -225,14 +392,13 @@ void setup() {
   Serial.print("[NODE] MAC: "); printMAC(myMAC); Serial.println();
 
   if (esp_now_init() != ESP_OK) {
-    Serial.println("[NODE] ESP-NOW init failed — restarting");
+    Serial.println("[NODE] ESP-NOW init failed - restarting");
     delay(1000); ESP.restart(); return;
   }
   esp_now_register_send_cb(OnDataSent);
   esp_now_register_recv_cb(OnDataRecv);
 
-  // Add broadcast peer so hub beacons (sent to FF:FF:...) are receivable
-  // and so we can reply from any address during pairing
+  // Register broadcast peer on PAIRING_CHANNEL
   uint8_t broadcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
   if (!esp_now_is_peer_exist(broadcast)) {
     esp_now_peer_info_t bcast = {};
@@ -245,7 +411,8 @@ void setup() {
   // Load saved pairing from NVS
   nodeLoadNVS();
   if (paired) {
-    Serial.print("[NODE] Restored pairing — Hub: "); printMAC(hubMAC); Serial.println();
+    Serial.print("[NODE] Restored pairing - Hub: "); printMAC(hubMAC); Serial.println();
+    // Register hub peer (we still listen for beacons to re-sync if needed)
     if (!esp_now_is_peer_exist(hubMAC)) {
       esp_now_peer_info_t peerInfo = {};
       memcpy(peerInfo.peer_addr, hubMAC, 6);
@@ -253,52 +420,89 @@ void setup() {
       peerInfo.encrypt = false;
       esp_now_add_peer(&peerInfo);
     }
+    currentChan = PAIRING_CHANNEL;
   } else {
-    Serial.println("[NODE] No saved pairing — scanning for Hub beacon...");
+    Serial.println("[NODE] No saved pairing - listening on ch1 for Hub beacon...");
   }
 }
 
 void loop() {
+  // Channel sweep ONLY when not paired
+  if (!paired) {
+    static unsigned long lastShout = 0;
+    if (millis() - lastShout > 500) {
+      lastShout = millis();
+      // Shout PairingRequest to broadcast address
+      uint8_t bcastMac[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+      PairingRequest req = {};
+      strncpy(req.magic, "WLMSREQ", 8);
+      memcpy(req.sensorMAC, myMAC, 6);
+      req.deviceId = 0;
+      req.pairingCode = 0;
+      req.auth = pairAuth((uint8_t*)&req, sizeof(req) - sizeof(req.auth));
+      esp_now_send(bcastMac, (uint8_t *)&req, sizeof(PairingRequest));
+      Serial.println("[NODE] TX: Shouting WLMSREQ (PairingRequest) to Broadcast");
+    }
+  }
+  
   if (paired) {
     uint16_t median;
-    if (readMedian(median)) {
+    bool hasReading = readMedian(median);
+    
+    if (hasReading) {
       // Seed EMA on first reading
-      if (emaValue < 0) emaValue = (int16_t)median;
-
-      // Plausibility check: if this median is >PLAUSIBLE_JUMP from our running EMA,
-      // it's almost certainly a spurious echo — discard it entirely
-      if (abs((int)median - (int)emaValue) > PLAUSIBLE_JUMP) {
-        Serial.printf("[NODE] SPIKE rejected: median=%d  EMA=%d\n", median, emaValue);
+      if (emaValue < 0) {
+        emaValue = (int16_t)median;
+        consecutiveSpikes = 0;
       } else {
-        // Apply EMA: new = alpha*median + (1-alpha)*old
-        emaValue = (EMA_ALPHA_NUM * (int)median + (EMA_ALPHA_DEN - EMA_ALPHA_NUM) * (int)emaValue) / EMA_ALPHA_DEN;
-
-        // Only transmit if changed by more than DEADBAND_MM
-        if (lastSentMm < 0 || abs((int)emaValue - (int)lastSentMm) > DEADBAND_MM) {
-          SensorData data;
-          data.deviceId  = myDeviceId;
-          data.distance  = emaValue;
-          data.timestamp = millis();
-          esp_err_t result = esp_now_send(hubMAC, (uint8_t *)&data, sizeof(SensorData));
-          if (result == ESP_OK) {
-            sendFailures = 0;
-            lastSentMm = emaValue;
-            Serial.printf("[NODE] Dist: %d mm  (raw median=%d mm)\n", emaValue, median);
-          } else {
-            sendFailures++;
-            Serial.printf("[NODE] Send fail #%d\n", sendFailures);
+        // Plausibility check
+        if (abs((int)median - (int)emaValue) > PLAUSIBLE_JUMP) {
+          consecutiveSpikes++;
+          Serial.printf("[NODE] Jump detected: median=%d  EMA=%d [#%d]\n", median, emaValue, consecutiveSpikes);
+          // If consecutive readings maintain the new level, accept it as real step change
+          if (consecutiveSpikes >= MAX_CONSECUTIVE_SPIKES) {
+            Serial.printf("[NODE] Step change confirmed -> new level: %d mm\n", median);
+            emaValue = (int16_t)median;
+            consecutiveSpikes = 0;
           }
         } else {
-          Serial.printf("[NODE] Stable (%d mm, no tx)\n", emaValue);
+          consecutiveSpikes = 0;
+          // Apply EMA: new = alpha*median + (1-alpha)*old
+          emaValue = (EMA_ALPHA_NUM * (int)median + (EMA_ALPHA_DEN - EMA_ALPHA_NUM) * (int)emaValue) / EMA_ALPHA_DEN;
         }
       }
     } else {
-      Serial.println("[NODE] Sensor read failed");
+      static unsigned long lastWarn = 0;
+      if (millis() - lastWarn > 3000) {
+        lastWarn = millis();
+        Serial.println("[NODE] Waiting for ultrasonic echo / target in range");
+      }
     }
 
+    // Determine if we should transmit:
+    // 1. If distance changed by > DEADBAND_MM (and we have a valid reading)
+    // 2. OR periodic heartbeat every HEARTBEAT_MS (2000ms) so Hub never times out!
+    bool valueChanged = (emaValue > 0 && (lastSentMm < 0 || abs((int)emaValue - (int)lastSentMm) > DEADBAND_MM));
+    bool heartbeatDue = (millis() - lastSend >= HEARTBEAT_MS);
 
-    // After 10 consecutive failures, assume hub changed — clear NVS and re-scan
-    if (sendFailures >= 10) {
+    if (valueChanged || heartbeatDue) {
+      SensorData data;
+      data.deviceId  = myDeviceId;
+      data.distance  = (emaValue > 0) ? emaValue : (hasReading ? (int)median : -1);
+      data.timestamp = millis();
+      esp_err_t result = esp_now_send(hubMAC, (uint8_t *)&data, sizeof(SensorData));
+      if (result == ESP_OK) {
+        lastSend = millis();
+        if (emaValue > 0) lastSentMm = emaValue;
+        Serial.printf("[NODE] TX: SensorData (Dist: %d mm, raw=%d mm)\n", data.distance, hasReading ? median : -1);
+      } else {
+        sendFailures++;
+        Serial.printf("[NODE] Send fail #%d\n", sendFailures);
+      }
+    }
+
+    // After 20 consecutive send failures, assume hub changed channel or reset
+    if (sendFailures >= 20) {
       Serial.println("[NODE] Too many failures — clearing NVS, restarting...");
       nodeClearNVS();
       ESP.restart();
@@ -316,24 +520,34 @@ void loop() {
 #include <WiFi.h>
 #include <TFT_eSPI.h>
 #include <WebServer.h>
+#include <DNSServer.h>
 #include "qrcode.h"
 #include <WiFi.h>
 #include <Preferences.h>
 bool invalidateCache = false;
+DNSServer dnsServer;
+bool isAPMode = false;
+String hubSSID = "";
+String hubPASS = "";
+const byte DNS_PORT = 53;
 void drawDisplay(bool fullRedraw);
 void drawPage0(bool fullRedraw);
 void drawPage1(bool fullRedraw);
 void drawStatusBar(bool fullRedraw);
 void drawMenu();
 void drawSlider();
+void drawQRCode(const char *text, const char *title);
+void startWifiAP();
+void broadcastBeacon();
 
 #include <esp_now.h>
 #include <esp_wifi.h>
 
-// ─── TANK CALIBRATION ─────────────────────────────────────────────────────────
-int tankEmptyMm = 2000;   // distance when tank is EMPTY (mm)
-int tankFullMm  = 200;    // distance when tank is FULL  (mm)
-int alertThreshold = 20;  // alert when fill % drops below this
+// ─── TANK & SENSOR CALIBRATION ───────────────────────────────────────────────
+int tankEmptyMm    = 2000;   // distance when tank is EMPTY (mm)
+int tankFullMm     = 200;    // distance when tank is FULL  (mm)
+int alertThreshold = 20;     // alert when fill % drops below this
+int sensorOffsetMm = 0;      // calibration offset added to raw sensor distance (mm)
 #define MAX_NODES 4
 
 // ─── TFT & Calibration ────────────────────────────────────────────────────────
@@ -387,9 +601,12 @@ WebServer server(80);
 
 bool isPairingMode = false;
 unsigned long pairingStartTime = 0;
+bool startupBeaconActive = false;
+unsigned long startupBeaconStart = 0;
+unsigned long lastStartupBeacon = 0;
 
 // ── Buzzer (pin 26, MMBT2222A NPN — HIGH = on) ───────────────────────────────
-#define BUZZER_PIN 26
+#define TRANSISTOR_PIN 26
 // Beep pattern state (non-blocking)
 bool     buzzerAlert   = false;   // true when at least one node is below threshold
 bool     buzzerOn      = false;   // current transistor state
@@ -399,7 +616,7 @@ int      buzzerPhase   = 0;       // cycles through ON/OFF timing
 // Call this from loop() — drives the buzzer without delay()
 void updateBuzzer() {
   if (!buzzerAlert) {
-    if (buzzerOn) { digitalWrite(BUZZER_PIN, LOW); buzzerOn = false; }
+    if (buzzerOn) { digitalWrite(TRANSISTOR_PIN, LOW); buzzerOn = false; }
     buzzerPhase = 0;
     return;
   }
@@ -411,8 +628,33 @@ void updateBuzzer() {
     buzzerPhase = (buzzerPhase + 1) % 4;
     bool shouldBeOn = (buzzerPhase == 0 || buzzerPhase == 2); // phases 0,2 = ON
     buzzerOn = shouldBeOn;
-    digitalWrite(BUZZER_PIN, buzzerOn ? HIGH : LOW);
+    digitalWrite(TRANSISTOR_PIN, buzzerOn ? HIGH : LOW);
   }
+}
+
+// ── NVS (Preferences) for paired node MACs & Calibration ────────────────────
+Preferences hubPrefs;
+
+void hubSaveCalibration() {
+  hubPrefs.begin("hub", false);
+  hubPrefs.putInt("emptyMm", tankEmptyMm);
+  hubPrefs.putInt("fullMm", tankFullMm);
+  hubPrefs.putInt("alertTh", alertThreshold);
+  hubPrefs.putInt("offsetMm", sensorOffsetMm);
+  hubPrefs.end();
+  Serial.printf("[HUB] Saved calibration: Empty=%d Full=%d Alert=%d%% Offset=%d\n",
+                tankEmptyMm, tankFullMm, alertThreshold, sensorOffsetMm);
+}
+
+void hubLoadCalibration() {
+  hubPrefs.begin("hub", true);
+  tankEmptyMm    = hubPrefs.getInt("emptyMm", 2000);
+  tankFullMm     = hubPrefs.getInt("fullMm", 200);
+  alertThreshold = hubPrefs.getInt("alertTh", 20);
+  sensorOffsetMm = hubPrefs.getInt("offsetMm", 0);
+  hubPrefs.end();
+  Serial.printf("[HUB] Loaded calibration: Empty=%d Full=%d Alert=%d%% Offset=%d\n",
+                tankEmptyMm, tankFullMm, alertThreshold, sensorOffsetMm);
 }
 
 // Check all nodes — update buzzerAlert flag
@@ -422,16 +664,13 @@ void checkAlerts() {
     if (!nodes[i].paired) continue;
     if (millis() - nodes[i].lastRecvTime > 15000) continue; // skip offline
     if (nodes[i].distance == -1) continue;
-    int pct = map(nodes[i].distance, tankEmptyMm, tankFullMm, 0, 100);
+    int dist = constrain(nodes[i].distance + sensorOffsetMm, 0, 5000);
+    int pct = map(dist, tankEmptyMm, tankFullMm, 0, 100);
     pct = constrain(pct, 0, 100);
     if (pct < alertThreshold) { anyAlert = true; break; }
   }
   buzzerAlert = anyAlert;
 }
-
-
-// ── NVS (Preferences) for paired node MACs ───────────────────────────────────
-Preferences hubPrefs;
 
 void hubSaveNodes() {
   hubPrefs.begin("hub", false);
@@ -461,7 +700,9 @@ void hubLoadNodes() {
     nodes[i].distance = -1;
     nodes[i].lastRecvTime = 0;
     // Register as ESP-NOW peer (will be done after esp_now_init in setup)
-    Serial.printf("[HUB] Loaded node %d from NVS\n", i+1);
+    Serial.printf("[HUB] Loaded node %d from NVS: %02X:%02X:%02X:%02X:%02X:%02X\n",
+                  i+1, nodes[i].mac[0], nodes[i].mac[1], nodes[i].mac[2],
+                  nodes[i].mac[3], nodes[i].mac[4], nodes[i].mac[5]);
   }
 }
 
@@ -492,26 +733,53 @@ void OnDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
 
   if (len == sizeof(SensorData)) {
     SensorData *data = (SensorData *)incomingData;
+    Serial.printf("[HUB] RX: Received SensorData from %02X:%02X:%02X:%02X:%02X:%02X -> Dist: %d mm\n",
+                  mac[0],mac[1],mac[2],mac[3],mac[4],mac[5], data->distance);
     for (int i = 0; i < MAX_NODES; i++) {
       if (nodes[i].paired && memcmp(nodes[i].mac, mac, 6) == 0) {
         // ── Known paired node: update data ──
-        if (nodes[i].distance != data->distance) forceRedraw = true;
+        bool wasOffline = (nodes[i].lastRecvTime == 0) || (millis() - nodes[i].lastRecvTime > 10000);
+        if (nodes[i].distance != data->distance || wasOffline) forceRedraw = true;
         nodes[i].distance = data->distance;
         nodes[i].lastRecvTime = millis();
         return;
       }
     }
-    // ── Unknown sender: check if it's a saved node that just rebooted ──
-    // (Node has hub MAC in NVS and is sending directly without re-pairing)
-    // We accept if the MAC is in our NVS-loaded list (paired=true at boot)
-    // already handled above — if we get here it's a truly unknown node, ignore.
     return;
   }
 
   if (len == sizeof(PairingRequest)) {
     PairingRequest *req = (PairingRequest *)incomingData;
     if (strncmp(req->magic, "WLMSREQ", 8) != 0) return;
-    if (req->pairingCode != pairingCode) return;
+    Serial.printf("[HUB] RX: Received WLMSREQ (PairingRequest) from %02X:%02X:%02X:%02X:%02X:%02X\n", mac[0],mac[1],mac[2],mac[3],mac[4],mac[5]);
+    // Validate auth tag
+    uint32_t expected = pairAuth((uint8_t*)req, sizeof(PairingRequest) - sizeof(req->auth));
+    if (req->auth != expected) { Serial.println("[HUB] Request auth FAIL"); return; }
+
+    // If this node is already in our NVS paired list, auto-confirm immediately!
+    for (int i = 0; i < MAX_NODES; i++) {
+      if (nodes[i].paired && memcmp(nodes[i].mac, mac, 6) == 0) {
+        if (!esp_now_is_peer_exist(mac)) {
+          esp_now_peer_info_t peer = {};
+          memcpy(peer.peer_addr, mac, 6);
+          peer.channel = 0;
+          peer.ifidx = isAPMode ? WIFI_IF_AP : WIFI_IF_STA;
+          peer.encrypt = false;
+          esp_now_add_peer(&peer);
+        }
+        PairingConfirm conf = {};
+        strncpy(conf.magic, "WLMSCONF", 8);
+        memcpy(conf.hubMAC, myMAC, 6);
+        conf.deviceId = req->deviceId;
+        conf.accepted = true;
+        conf.auth = pairAuth((uint8_t*)&conf, sizeof(PairingConfirm) - sizeof(conf.auth));
+        esp_now_send(mac, (uint8_t *)&conf, sizeof(PairingConfirm));
+        Serial.printf("[HUB] Auto-reconfirmed known Node %d\n", i+1);
+        return;
+      }
+    }
+
+    // Accept any pairing code since node initiates
     if (currentMenuPage != 2) {
       Serial.println("[HUB] Pairing request ignored — not in pairing mode");
       return;
@@ -552,6 +820,72 @@ void drawHeader() {
   tft.print("MENU");
 }
 
+void startWifiAP() {
+  WiFi.mode(WIFI_AP_STA);
+  uint8_t mac[6];
+  WiFi.macAddress(mac);
+  char apSSID[32];
+  sprintf(apSSID, "HUB_%02X%02X", mac[4], mac[5]);
+  WiFi.softAP(apSSID, "12345678");
+  delay(200);
+
+  char qrStr[64];
+  sprintf(qrStr, "WIFI:T:WPA;S:%s;P:12345678;;", apSSID);
+  inMenu = false;
+  drawQRCode(qrStr, "Scan, then visit:");
+
+  tft.setTextColor(TFT_WHITE);
+  tft.setTextSize(1);
+  tft.setCursor(10, 220);
+  tft.print("192.168.4.1  (tap screen to cancel)");
+
+  WebServer apServer(80);
+  DNSServer apDns;
+  apDns.setErrorReplyCode(DNSReplyCode::NoError);
+  apDns.start(53, "*", WiFi.softAPIP());
+
+  bool saved = false;
+  apServer.on("/", [&]() {
+    String pg = "<!DOCTYPE html><html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>WiFi Setup</title><style>body{background:#0f172a;color:#fff;font-family:sans-serif;padding:20px}input{width:100%;padding:10px;margin:10px 0;box-sizing:border-box;border-radius:5px;border:none}button{width:100%;padding:15px;background:#38bdf8;color:#fff;border:none;border-radius:5px;font-weight:bold}</style></head><body>";
+    pg += "<h2>AQUAPULSE WiFi Setup</h2><p>Enter your home network credentials.</p>";
+    pg += "<form action='/save' method='GET'><input name='s' placeholder='Network Name (SSID)' required><input name='p' placeholder='Password' type='password'><button type='submit'>Connect Hub</button></form></body></html>";
+    apServer.send(200, "text/html; charset=utf-8", pg);
+  });
+  apServer.on("/save", [&]() {
+    String s = apServer.arg("s");
+    String p = apServer.arg("p");
+    apServer.send(200, "text/html", "<html><body style='background:#0f172a;color:#fff;padding:20px'><h2>Saved! Hub rebooting...</h2></body></html>");
+    delay(600);
+    Preferences pr;
+    pr.begin("hub", false);
+    pr.putString("ssid", s);
+    pr.putString("pass", p);
+    pr.end();
+    delay(400);
+    ESP.restart();
+  });
+  apServer.onNotFound([&]() {
+    apServer.sendHeader("Location", "http://192.168.4.1/", true);
+    apServer.send(302, "text/plain", "");
+  });
+  apServer.begin();
+
+  while (!saved) {
+    apDns.processNextRequest();
+    apServer.handleClient();
+    uint16_t tx, ty;
+    if (tft.getTouch(&tx, &ty)) { delay(300); break; }
+    yield();
+  }
+  apDns.stop();
+  WiFi.softAPdisconnect(true);
+  WiFi.mode(WIFI_STA);
+  esp_wifi_set_channel(PAIRING_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  inMenu = true;
+  currentMenuPage = 4;
+  drawMenu();
+}
+
 void drawSlider() {
   int sliderX = 8, sliderY = 50, sliderW = 304, sliderH = 18;
   tft.fillRect(sliderX - 12, sliderY - 12, sliderW + 24, sliderH + 24, COLOR_BG);
@@ -573,7 +907,7 @@ void drawQRCode(String url, String title) {
     tft.setTextSize(1);
     tft.setCursor(10, 35);
     char ssidStr[64];
-    sprintf(ssidStr, "WiFi: AQP_%02X%02X%02X%02X%02X%02X (12345678)", myMAC[0], myMAC[1], myMAC[2], myMAC[3], myMAC[4], myMAC[5]);
+    sprintf(ssidStr, "WiFi: HUB_%02X%02X%02X%02X%02X%02X (12345678)", myMAC[0], myMAC[1], myMAC[2], myMAC[3], myMAC[4], myMAC[5]);
     tft.print(ssidStr);
     
     QRCode qrcode;
@@ -681,8 +1015,9 @@ void drawMenu() {
     tft.fillRoundRect(218, bY, 97, bH, 5, COLOR_DARK_GRAY);
 
     tft.setTextSize(1);
-    tft.setTextColor(COLOR_WHITE);
-    tft.setCursor(16,  bY + 20); tft.print("DASHBOARD");
+    tft.setTextColor(COLOR_CYAN);
+    tft.setCursor(16,  bY + 14); tft.print("WiFi");
+    tft.setCursor(16,  bY + 28); tft.print("Setup");
     tft.setCursor(122, bY + 14); tft.print("NODE");
     tft.setCursor(122, bY + 28); tft.print("CONFIG");
     tft.setTextColor(COLOR_ACCENT);
@@ -792,30 +1127,28 @@ void drawMenu() {
     tft.print("CANCEL");
   }
 
-  // ── Page 3: Tank Calibration ──────────────────────────────────────────────
+  // ── Page 3: Tank & Sensor Calibration ─────────────────────────────────────
   else if (currentMenuPage == 3) {
     tft.fillRect(0, 0, 320, 24, COLOR_DARK_GRAY);
     tft.setTextColor(COLOR_HEADER);
     tft.setTextSize(2);
     tft.setCursor(6, 4);
-    tft.print("TANK CAL");
+    tft.print("TANK & SENSOR CAL");
 
-    // Each row: label | value | [+] [-]
-    // rowY positions: 32, 84, 136  (52px per row, 42px buttons)
     char buf[12];
-    int rH = 42;
-    int rYs[3] = {30, 82, 134};
-    const char* labels[3] = {"EMPTY mm", "FULL  mm", "ALERT %"};
-    uint16_t cols[3] = {COLOR_ORANGE, COLOR_ACCENT, COLOR_RED};
+    int rH = 34;
+    int rYs[4] = {28, 66, 104, 142};
+    const char* labels[4] = {"EMPTY mm", "FULL  mm", "OFFSET mm", "ALERT %"};
+    uint16_t cols[4] = {COLOR_ORANGE, COLOR_ACCENT, COLOR_CYAN, COLOR_RED};
 
-    for (int r = 0; r < 3; r++) {
+    for (int r = 0; r < 4; r++) {
       int rY = rYs[r];
-      tft.fillRoundRect(4, rY, 312, rH, 5, COLOR_DARK_GRAY);
+      tft.fillRoundRect(4, rY, 312, rH, 4, COLOR_DARK_GRAY);
 
       // Label
       tft.setTextColor(COLOR_WHITE);
       tft.setTextSize(1);
-      tft.setCursor(10, rY + 6);
+      tft.setCursor(10, rY + 12);
       tft.print(labels[r]);
 
       // Value
@@ -823,28 +1156,29 @@ void drawMenu() {
       tft.setTextSize(2);
       if (r == 0) sprintf(buf, "%4d", tankEmptyMm);
       else if (r == 1) sprintf(buf, "%4d", tankFullMm);
+      else if (r == 2) sprintf(buf, "%+4d", sensorOffsetMm);
       else sprintf(buf, "%3d%%", alertThreshold);
-      tft.setCursor(105, rY + 12);
+      tft.setCursor(110, rY + 9);
       tft.print(buf);
 
       // [+] button
-      tft.fillRoundRect(224, rY + 4, 38, rH - 8, 4, 0x03E0);
+      tft.fillRoundRect(224, rY + 3, 38, rH - 6, 4, 0x03E0);
       tft.setTextColor(COLOR_WHITE);
       tft.setTextSize(2);
-      tft.setCursor(234, rY + 13);
+      tft.setCursor(236, rY + 8);
       tft.print("+");
 
       // [-] button
-      tft.fillRoundRect(268, rY + 4, 38, rH - 8, 4, 0xC000);
-      tft.setCursor(278, rY + 13);
+      tft.fillRoundRect(268, rY + 3, 38, rH - 6, 4, 0xC000);
+      tft.setCursor(280, rY + 8);
       tft.print("-");
     }
 
     // BACK button
-    tft.fillRoundRect(8, 186, 304, 34, 6, COLOR_BLUE);
+    tft.fillRoundRect(8, 184, 304, 36, 6, COLOR_BLUE);
     tft.setTextColor(COLOR_WHITE);
     tft.setTextSize(2);
-    tft.setCursor(134, 194);
+    tft.setCursor(134, 193);
     tft.print("BACK");
   }
 
@@ -879,6 +1213,50 @@ void drawMenu() {
     tft.setTextColor(COLOR_WHITE);
     tft.setTextSize(2);
     tft.setCursor(134, 172);
+    tft.print("BACK");
+  }
+  else if (currentMenuPage == 4) {
+    // WiFi Setup info page
+    tft.fillRect(0, 0, 320, 24, COLOR_DARK_GRAY);
+    tft.setTextColor(COLOR_HEADER);
+    tft.setTextSize(2);
+    tft.setCursor(6, 4);
+    tft.print("WIFI SETUP");
+
+    tft.setTextSize(1);
+    tft.setTextColor(COLOR_WHITE);
+    tft.setCursor(10, 32);
+    tft.print("Connect Hub to home WiFi for OTA.");
+
+    // Start Setup button
+    tft.fillRoundRect(8, 54, 304, 50, 6, COLOR_CYAN);
+    tft.setTextColor(COLOR_BG);
+    tft.setTextSize(2);
+    tft.setCursor(50, 70);
+    tft.print("Start WiFi Setup AP");
+
+    // Current saved WiFi
+    tft.setTextSize(1);
+    tft.setTextColor(COLOR_WHITE);
+    tft.setCursor(10, 116);
+    if (hubSSID.length() > 0) {
+      tft.print("Saved: "); tft.print(hubSSID);
+    } else {
+      tft.print("No WiFi saved.");
+    }
+
+    // Forget WiFi button
+    tft.fillRoundRect(8, 132, 304, 36, 6, 0xA000);
+    tft.setTextColor(COLOR_WHITE);
+    tft.setTextSize(1);
+    tft.setCursor(70, 145);
+    tft.print("Forget saved WiFi & restart");
+
+    // BACK
+    tft.fillRoundRect(8, 182, 304, 38, 6, COLOR_DARK_GRAY);
+    tft.setTextColor(COLOR_WHITE);
+    tft.setTextSize(2);
+    tft.setCursor(134, 192);
     tft.print("BACK");
   }
 }
@@ -979,6 +1357,8 @@ void handleTouch() {
               pairingCode = random(1000, 9999);
               pairingStartTime = millis();
               currentMenuPage = 2;
+              broadcastBeacon(); // Send immediately so nodes appear without delay
+              lastBeaconTime = millis();
               drawMenu();
             }
             // FORGET ALL (x=162..312, y=68..114)
@@ -1018,14 +1398,17 @@ void handleTouch() {
                               if (esp_now_is_peer_exist(nodes[slot].mac)) esp_now_del_peer(nodes[slot].mac);
                               esp_now_peer_info_t peer = {};
                               memcpy(peer.peer_addr, nodes[slot].mac, 6);
-                              peer.channel = PAIRING_CHANNEL;
+                              peer.channel = 0;
+                              peer.ifidx = isAPMode ? WIFI_IF_AP : WIFI_IF_STA;
                               peer.encrypt = false;
                               esp_now_add_peer(&peer);
-                              PairingConfirm conf;
+                              PairingConfirm conf = {};
                               strncpy(conf.magic, "WLMSCONF", 8);
                               memcpy(conf.hubMAC, myMAC, 6);
                               conf.deviceId = discoveredNodes[i].deviceId;
                               conf.accepted = true;
+                              conf.auth = pairAuth((uint8_t*)&conf, sizeof(PairingConfirm) - sizeof(conf.auth));
+                              Serial.println("[HUB] TX: Sending WLMSCONF (PairingConfirm)");
                               esp_now_send(nodes[slot].mac, (uint8_t *)&conf, sizeof(PairingConfirm));
                               hubSaveNodes(); // ← persist to NVS
                               Serial.printf("[HUB] Paired node in slot %d — saved to NVS\n", slot+1);
@@ -1045,26 +1428,57 @@ void handleTouch() {
               }
           }
           else if (currentMenuPage == 3) {
-            // Rows: rYs = {30,82,134}, buttons at x=224..262(+) and x=268..306(-)
-            int rYs[3] = {30, 82, 134};
-            for (int r = 0; r < 3; r++) {
+            int rYs[4] = {28, 66, 104, 142};
+            for (int r = 0; r < 4; r++) {
               int rY = rYs[r];
-              if (startY > rY+4 && startY < rY+38) {
-                if (startX > 224 && startX < 262) { // [+]
-                  if (r == 0) tankEmptyMm  = constrain(tankEmptyMm  + 50, 100, 5000);
-                  else if (r == 1) tankFullMm = constrain(tankFullMm + 10, 10, tankEmptyMm - 50);
-                  else alertThreshold = constrain(alertThreshold + 5, 5, 80);
+              if (startY >= rY && startY <= rY + 34) {
+                if (startX > 220 && startX < 264) { // [+]
+                  if (r == 0) tankEmptyMm    = constrain(tankEmptyMm + 50, 100, 5000);
+                  else if (r == 1) tankFullMm   = constrain(tankFullMm + 10, 10, tankEmptyMm - 50);
+                  else if (r == 2) sensorOffsetMm = constrain(sensorOffsetMm + 10, -500, 500);
+                  else alertThreshold          = constrain(alertThreshold + 5, 5, 80);
+                  hubSaveCalibration();
+                  invalidateCache = true;
+                  forceRedraw = true;
                   drawMenu();
-                } else if (startX > 268 && startX < 306) { // [-]
-                  if (r == 0) tankEmptyMm  = constrain(tankEmptyMm  - 50, 100, 5000);
-                  else if (r == 1) tankFullMm = constrain(tankFullMm - 10, 10, tankEmptyMm - 50);
-                  else alertThreshold = constrain(alertThreshold - 5, 5, 80);
+                } else if (startX > 264 && startX < 308) { // [-]
+                  if (r == 0) tankEmptyMm    = constrain(tankEmptyMm - 50, 100, 5000);
+                  else if (r == 1) tankFullMm   = constrain(tankFullMm - 10, 10, tankEmptyMm - 50);
+                  else if (r == 2) sensorOffsetMm = constrain(sensorOffsetMm - 10, -500, 500);
+                  else alertThreshold          = constrain(alertThreshold - 5, 5, 80);
+                  hubSaveCalibration();
+                  invalidateCache = true;
+                  forceRedraw = true;
                   drawMenu();
                 }
               }
             }
-            // BACK y=186..220
-            if (startY > 186 && startY < 220) {
+            // BACK (y=180..230)
+            if (startY > 180 && startY < 230) {
+              hubSaveCalibration();
+              currentMenuPage = 0;
+              drawMenu();
+            }
+          }
+          else if (currentMenuPage == 4) {
+            // Start WiFi Setup AP button (y=54..104)
+            if (startY > 54 && startY < 104) {
+              startWifiAP();
+            }
+            // Forget WiFi button (y=132..168)
+            else if (startY > 132 && startY < 168) {
+              Preferences pr;
+              pr.begin("hub", false);
+              pr.remove("ssid");
+              pr.remove("pass");
+              pr.end();
+              hubSSID = "";
+              hubPASS = "";
+              delay(300);
+              ESP.restart();
+            }
+            // BACK (y=182..220)
+            else if (startY > 182 && startY < 220) {
               currentMenuPage = 0;
               drawMenu();
             }
@@ -1079,9 +1493,9 @@ void handleTouch() {
               tft.setCursor(95, 66);
               tft.print("TEST BUZZER");
               
-              digitalWrite(BUZZER_PIN, HIGH);
+              digitalWrite(TRANSISTOR_PIN, HIGH);
               delay(500); // Test beep
-              digitalWrite(BUZZER_PIN, LOW);
+              digitalWrite(TRANSISTOR_PIN, LOW);
               
               drawMenu(); // restore original button color
             }
@@ -1107,43 +1521,59 @@ void handleTouch() {
 
 
 void broadcastBeacon() {
-  PairingBeacon b;
+  PairingBeacon b = {};
   strncpy(b.magic, "WLMSHUB", 8);
   memcpy(b.hubMAC, myMAC, 6);
-  b.channel = PAIRING_CHANNEL;
+  b.channel = PAIRING_CHANNEL;  // always tell node we're on pairing channel
   b.pairingCode = pairingCode;
+  b.auth = pairAuth((uint8_t*)&b, sizeof(PairingBeacon) - sizeof(b.auth));
   
   uint8_t broadcast[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
   esp_now_send(broadcast, (uint8_t *)&b, sizeof(PairingBeacon));
 }
 
 String getDashboardHTML() {
-  String html = "<html><head><meta name='viewport' content='width=device-width, initial-scale=1'><style>";
-  html += "body { font-family: Arial; text-align: center; background: #222; color: #fff; }";
-  html += ".tank { display: inline-block; width: 100px; margin: 10px; padding: 10px; background: #333; border-radius: 8px; }";
-  html += "</style></head><body><h1>WLMS Dashboard</h1>";
+  String html = "<!DOCTYPE html><html lang='en'><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width, initial-scale=1'><title>AQUAPULSE Dashboard</title><style>";
+  html += "body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; text-align: center; background: #0f172a; color: #fff; margin:0; padding:20px; }";
+  html += ".grid { display: flex; flex-wrap: wrap; justify-content: center; gap: 15px; margin: 20px 0; }";
+  html += ".tank { width: 130px; padding: 15px; background: #1e293b; border-radius: 12px; border: 1px solid #334155; }";
+  html += ".card { max-width: 440px; margin: 20px auto; padding: 20px; background: #1e293b; border-radius: 12px; text-align: left; }";
+  html += "label { font-size: 13px; color: #94a3b8; display: block; margin-top: 10px; }";
+  html += "input { width: 100%; padding: 8px; margin: 4px 0 10px; background: #0f172a; border: 1px solid #475569; color: #fff; border-radius: 6px; box-sizing: border-box; }";
+  html += "button { width: 100%; padding: 12px; background: #0284c7; color: #fff; border: none; border-radius: 6px; font-weight: bold; cursor: pointer; margin-top: 10px; }";
+  html += "</style></head><body><h1>AQUAPULSE Dashboard</h1><div class='grid'>";
   for (int i=0; i<4; i++) {
     if (nodes[i].paired) {
+      bool offline = (millis() - nodes[i].lastRecvTime > 10000);
       html += "<div class='tank'><h3>Node " + String(i+1) + "</h3>";
-      long d = nodes[i].distance;
-      if (d == -1) {
-         html += "<p>Distance: -- mm</p>";
+      long rawD = nodes[i].distance;
+      if (rawD == -1 || offline) {
+         html += "<p style='color:#f87171'>" + String(offline ? "OFFLINE" : "-- mm") + "</p>";
       } else {
-         html += "<p>Distance: " + String(d) + " mm</p>";
+         long d = constrain(rawD + sensorOffsetMm, 0, 5000);
+         html += "<p>Dist: " + String(d) + " mm</p>";
          int pct = map(d, tankEmptyMm, tankFullMm, 0, 100);
          pct = constrain(pct, 0, 100);
-         html += "<p>Level: " + String(pct) + "%</p>";
+         html += "<p style='font-size:24px;font-weight:bold;color:#38bdf8'>" + String(pct) + "%</p>";
       }
       html += "</div>";
     }
   }
-  html += "<br><a href='/pairing' style='color:#4DA6FF'>Pairing Mode</a>";
+  html += "</div>";
+  html += "<div class='card'><h3>Tank & Sensor Calibration</h3>";
+  html += "<form action='/savecalib' method='GET'>";
+  html += "<label>Tank Empty Distance (mm):</label><input type='number' name='empty' value='" + String(tankEmptyMm) + "'>";
+  html += "<label>Tank Full Distance (mm):</label><input type='number' name='full' value='" + String(tankFullMm) + "'>";
+  html += "<label>Sensor Distance Offset (mm):</label><input type='number' name='offset' value='" + String(sensorOffsetMm) + "'>";
+  html += "<label>Alert Threshold (%):</label><input type='number' name='alert' value='" + String(alertThreshold) + "'>";
+  html += "<button type='submit'>Save Calibration</button></form></div>";
+  html += "<br><a href='/pairing' style='color:#38bdf8'>Pairing Mode</a>";
   html += "</body></html>";
   return html;
 }
 
 String getPairingHTML() {
-  return "<html><head><meta name='viewport' content='width=device-width, initial-scale=1'><style>"
+  return "<!DOCTYPE html><html lang='en'><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width, initial-scale=1'><title>WiFi Setup</title><style>"
          "body { font-family: Arial; text-align: center; background: #222; color: #fff; margin-top: 50px;}"
          ".btn { display: inline-block; padding: 15px 30px; background: #4DA6FF; color: white; text-decoration: none; border-radius: 5px; font-weight: bold; }"
          "</style></head><body><h2>Node Pairing</h2>"
@@ -1206,7 +1636,8 @@ void updatePage0() {
     int x = xs[i], y = ys[i];
     
     bool offline = (millis() - nodes[i].lastRecvTime > 10000);
-    int dist = nodes[i].distance;
+    int rawDist = nodes[i].distance;
+    int dist = rawDist != -1 ? constrain(rawDist + sensorOffsetMm, 0, 5000) : -1;
     int percent = 0;
     if (dist != -1) {
       percent = map(dist, tankEmptyMm, tankFullMm, 0, 100);
@@ -1376,7 +1807,8 @@ void updatePage1() {
     int x = startX + i * spacing;
 
     bool offline = (millis() - nodes[i].lastRecvTime > 10000);
-    int dist     = nodes[i].distance;
+    int rawDist  = nodes[i].distance;
+    int dist     = rawDist != -1 ? constrain(rawDist + sensorOffsetMm, 0, 5000) : -1;
     int percent  = 0;
     if (dist != -1 && nodes[i].paired) {
       percent = map(dist, tankEmptyMm, tankFullMm, 0, 100);
@@ -1474,8 +1906,8 @@ void setup() {
     nodes[i].lastRecvTime = 0;
   }
 
-  pinMode(BUZZER_PIN, OUTPUT);
-  digitalWrite(BUZZER_PIN, LOW);
+  pinMode(TRANSISTOR_PIN, OUTPUT);
+  digitalWrite(TRANSISTOR_PIN, LOW);
 
   pinMode(17, OUTPUT);
   digitalWrite(17, HIGH);
@@ -1490,9 +1922,9 @@ void setup() {
   tft.fillScreen(COLOR_BG);
 
   // Short startup beep to confirm buzzer works
-  digitalWrite(BUZZER_PIN, HIGH);
+  digitalWrite(TRANSISTOR_PIN, HIGH);
   delay(100);
-  digitalWrite(BUZZER_PIN, LOW);
+  digitalWrite(TRANSISTOR_PIN, LOW);
 
   // ── AQUAPULSE Splash Animation ───────────────────────────────────────────
   // 1. Fade-in water rising from bottom
@@ -1530,19 +1962,70 @@ void setup() {
   delay(400);
 
   
-  WiFi.mode(WIFI_AP_STA);
-  WiFi.disconnect();
   WiFi.macAddress(myMAC);
-  char ssid[32];
-  sprintf(ssid, "AQP_%02X%02X%02X%02X%02X%02X", myMAC[0], myMAC[1], myMAC[2], myMAC[3], myMAC[4], myMAC[5]);
-  WiFi.softAP(ssid, "12345678");
   pairingCode = (myMAC[4] << 8) | myMAC[5];
-  esp_wifi_set_channel(PAIRING_CHANNEL, WIFI_SECOND_CHAN_NONE);
 
-  server.on("/", []() { server.send(200, "text/html", getDashboardHTML()); });
-  server.on("/pairing", []() { server.send(200, "text/html", getPairingHTML()); });
-  server.begin();
-  ArduinoOTA.begin();
+  hubPrefs.begin("hub", true);
+  hubSSID = hubPrefs.getString("ssid", "");
+  hubPASS = hubPrefs.getString("pass", "");
+  hubPrefs.end();
+  
+  tft.fillScreen(COLOR_BG);
+  tft.setCursor(10, 100);
+  tft.setTextColor(COLOR_WHITE);
+  
+  bool connected = false;
+  if (hubSSID.length() > 0) {
+    tft.println("Connecting to WiFi:");
+    tft.setTextColor(COLOR_ACCENT);
+    tft.println(hubSSID);
+    
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(hubSSID.c_str(), hubPASS.c_str());
+    unsigned long t = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - t < 10000) {
+      delay(300);
+      tft.print(".");
+    }
+    connected = (WiFi.status() == WL_CONNECTED);
+  }
+  
+  if (connected) {
+    isAPMode = false;
+    tft.println("\nConnected!");
+    delay(800);
+    server.on("/", []() { server.send(200, "text/html", getDashboardHTML()); });
+    server.on("/pairing", []() { server.send(200, "text/html", getPairingHTML()); });
+    server.on("/savecalib", []() {
+      if (server.hasArg("empty"))  tankEmptyMm    = constrain(server.arg("empty").toInt(), 100, 5000);
+      if (server.hasArg("full"))   tankFullMm     = constrain(server.arg("full").toInt(), 10, tankEmptyMm - 10);
+      if (server.hasArg("offset")) sensorOffsetMm = constrain(server.arg("offset").toInt(), -500, 500);
+      if (server.hasArg("alert"))  alertThreshold = constrain(server.arg("alert").toInt(), 5, 80);
+      hubSaveCalibration();
+      invalidateCache = true;
+      forceRedraw = true;
+      server.send(200, "text/html", "<!DOCTYPE html><html><head><meta http-equiv='refresh' content='2;url=/'><style>body{background:#0f172a;color:#fff;font-family:sans-serif;text-align:center;padding:50px}</style></head><body><h2>Calibration Saved!</h2><p>Redirecting to dashboard...</p></body></html>");
+    });
+    server.on("/savewifi", []() {
+      hubPrefs.begin("hub", false);
+      hubPrefs.putString("ssid", server.arg("s"));
+      hubPrefs.putString("pass", server.arg("p"));
+      hubPrefs.end();
+      server.send(200, "text/html", "<html><body style='background:#0f172a;color:#fff;font-family:sans-serif;padding:20px'><h2>Saved! Rebooting...</h2></body></html>");
+      delay(1000);
+      ESP.restart();
+    });
+    server.begin();
+    ArduinoOTA.begin();
+  } else {
+    // No WiFi configured – start normally without blocking.
+    // User can set up WiFi later from the menu (for OTA updates).
+    isAPMode = false;
+    WiFi.mode(WIFI_STA); // Needed for ESP-NOW on channel
+    esp_wifi_set_channel(PAIRING_CHANNEL, WIFI_SECOND_CHAN_NONE);
+    tft.println("\nNo WiFi - ESP-NOW only");
+    delay(600);
+  }
 
   if (esp_now_init() != ESP_OK) {
     Serial.println("Error initializing ESP-NOW");
@@ -1556,17 +2039,19 @@ void setup() {
     esp_now_peer_info_t bcast = {};
     memset(bcast.peer_addr, 0xFF, 6);
     bcast.channel = 0;
-    bcast.ifidx = WIFI_IF_STA;
+    bcast.ifidx = isAPMode ? WIFI_IF_AP : WIFI_IF_STA;
     bcast.encrypt = false;
     esp_now_add_peer(&bcast);
 
-    // Load saved nodes from NVS and re-register as peers
+    // Load saved nodes and calibration from NVS
     hubLoadNodes();
+    hubLoadCalibration();
     for (int i = 0; i < MAX_NODES; i++) {
       if (nodes[i].paired) {
         esp_now_peer_info_t peer = {};
         memcpy(peer.peer_addr, nodes[i].mac, 6);
-        peer.channel = PAIRING_CHANNEL;
+        peer.channel = 0; // Use current channel
+        peer.ifidx = isAPMode ? WIFI_IF_AP : WIFI_IF_STA;
         peer.encrypt = false;
         esp_now_add_peer(&peer);
       }
@@ -1583,15 +2068,32 @@ void loop() {
   handleTouch();
   updateBuzzer(); // non-blocking buzzer driver
 
+  // Startup beacons (10s window after boot) so pre-existing nodes can re-sync
+  if (startupBeaconActive) {
+    if (millis() - startupBeaconStart < 10000) {
+      if (millis() - lastStartupBeacon > 500) {
+        lastStartupBeacon = millis();
+        broadcastBeacon();
+      }
+    } else {
+      startupBeaconActive = false;
+      Serial.println("[HUB] Startup beacon window closed");
+    }
+  }
+
   if (inMenu) {
     if (currentMenuPage == 2) {
-      if (millis() - lastBeaconTime > 1000) {
+      // Fast 300ms beacons during pairing mode
+      if (millis() - lastBeaconTime > 300) {
         broadcastBeacon();
         lastBeaconTime = millis();
       }
-      if (forceRedraw) {
-        drawMenu();
+      // Periodic redraw for dot animation (every 400ms) + when node found
+      static unsigned long lastScanRedraw = 0;
+      if (forceRedraw || millis() - lastScanRedraw > 400) {
+        lastScanRedraw = millis();
         forceRedraw = false;
+        drawMenu();
       }
     }
     return;
@@ -1621,3 +2123,4 @@ void loop() {
   }
 }
 #endif // HUB_RS485_SENSOR
+
