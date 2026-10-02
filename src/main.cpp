@@ -61,6 +61,7 @@ typedef struct __attribute__((packed)) {
 #include <esp_now.h>
 #include <esp_wifi.h>
 #include <HardwareSerial.h>
+#include <SoftwareSerial.h>
 #include <Preferences.h>
 
 // User confirmed connections:
@@ -69,6 +70,7 @@ typedef struct __attribute__((packed)) {
 #define DYP_TX D1
 #define DYP_RX D2
 HardwareSerial dypSerial(1);
+SoftwareSerial dypSoftSerial;
 
 uint8_t hubMAC[6];
 bool paired = false;
@@ -254,78 +256,157 @@ int16_t emaValue   = -1;
 int16_t lastSentMm = -1;
 int consecutiveSpikes = 0;
 
-int pinComb = 0; // 0: RX=D2, TX=D1. 1: RX=D1, TX=D2.
-bool pinLocked = false;
-int zeroCycles = 0;
+static uint8_t rxBuf[64];
+static int rxLen = 0;
 
-void initSensorPins(int comb) {
+bool parseBuffer(uint8_t *buf, int len, uint16_t &out, int &consumed) {
+  for (int i = 0; i <= len - 4; i++) {
+    if (buf[i] == 0xFF) {
+      uint8_t sum = (buf[i] + buf[i+1] + buf[i+2]) & 0xFF;
+      if (sum == buf[i+3]) {
+        uint16_t v = ((uint16_t)buf[i+1] << 8) | buf[i+2];
+        consumed = i + 4;
+        if (v >= SENSOR_MIN_MM && v <= SENSOR_MAX_MM) {
+          out = v;
+          return true;
+        }
+      }
+    }
+  }
+  consumed = 0;
+  return false;
+}
+
+bool checkUartPacket(uint16_t &out) {
+  while (dypSerial.available() && rxLen < (int)sizeof(rxBuf)) {
+    rxBuf[rxLen++] = dypSerial.read();
+  }
+  while (dypSoftSerial.available() && rxLen < (int)sizeof(rxBuf)) {
+    rxBuf[rxLen++] = dypSoftSerial.read();
+  }
+
+  int consumed = 0;
+  if (parseBuffer(rxBuf, rxLen, out, consumed)) {
+    rxLen -= consumed;
+    if (rxLen > 0) memmove(rxBuf, rxBuf + consumed, rxLen);
+    return true;
+  }
+  // Drop leading bytes that are not 0xFF
+  while (rxLen > 0 && rxBuf[0] != 0xFF) {
+    rxLen--;
+    if (rxLen > 0) memmove(rxBuf, rxBuf + 1, rxLen);
+  }
+  return false;
+}
+
+// Clean, stable UART communication for DYP-A02YYTW
+static int currentComb = 0; // 0 = RX:D2 TX:D1, 1 = RX:D1 TX:D2
+static bool useSoftSerial = false;
+static int currentBaudIdx = 0;
+static const int BAUD_RATES[] = {9600, 115200};
+static const int NUM_BAUDS = sizeof(BAUD_RATES) / sizeof(BAUD_RATES[0]);
+
+static unsigned long lastComboSwitch = 0;
+static bool sensorLocked = false;
+static int lockRxPin = D2;
+static int lockTxPin = D1;
+
+void setUartConfig(int rxPin, int txPin, int baud, bool soft) {
   dypSerial.end();
-  delay(15);
-  if (comb == 0) {
-    dypSerial.begin(9600, SERIAL_8N1, D2, D1);
-    pinMode(D2, INPUT_PULLUP);
-    Serial.println("[NODE] Sensor UART: RX=D2, TX=D1 (9600 8N1)");
+  dypSoftSerial.end();
+  delay(30);
+  rxLen = 0;
+
+  if (soft) {
+    dypSoftSerial.begin(baud, SWSERIAL_8N1, rxPin, txPin, false);
+    gpio_pullup_en((gpio_num_t)rxPin);
+    Serial.printf("[NODE-UART] Config: SoftwareSerial RX=D%d(gpio%d), TX=D%d(gpio%d) @ %d baud\n",
+                  (rxPin == D2 ? 2 : 1), rxPin, (txPin == D1 ? 1 : 2), txPin, baud);
   } else {
-    dypSerial.begin(9600, SERIAL_8N1, D1, D2);
-    pinMode(D1, INPUT_PULLUP);
-    Serial.println("[NODE] Sensor UART: RX=D1, TX=D2 (9600 8N1)");
+    dypSerial.begin(baud, SERIAL_8N1, rxPin, txPin);
+    gpio_pullup_en((gpio_num_t)rxPin);
+    Serial.printf("[NODE-UART] Config: HardwareSerial RX=D%d(gpio%d), TX=D%d(gpio%d) @ %d baud\n",
+                  (rxPin == D2 ? 2 : 1), rxPin, (txPin == D1 ? 1 : 2), txPin, baud);
   }
 }
 
-// Clean, robust reading of 1 sample from the DYP sensor via UART
+void scanAndDetectSensor() {
+  Serial.println("\n==========================================");
+  Serial.println("[NODE] DYP SENSOR STARTUP");
+  Serial.println("==========================================");
+  currentComb = 0; // Default: RX=D2, TX=D1
+  useSoftSerial = false;
+  currentBaudIdx = 0; // 9600
+  setUartConfig(D2, D1, 9600, false);
+  lastComboSwitch = millis();
+}
+
+static int pingCount = 0;
+
 bool readRaw(uint16_t &out) {
-  // 1. Check if sensor auto-outputted 4+ bytes (Auto Mode)
-  if (dypSerial.available() >= 4) {
-    uint8_t d[32];
-    int n = min((int)dypSerial.available(), 32);
-    for (int i = 0; i < n; i++) d[i] = dypSerial.read();
-    for (int i = 0; i <= n - 4; i++) {
-      if (d[i] == 0xFF) {
-        uint8_t sum = (d[i] + d[i+1] + d[i+2]) & 0xFF;
-        if (sum == d[i+3]) {
-          uint16_t v = ((uint16_t)d[i+1] << 8) | d[i+2];
-          if (v >= SENSOR_MIN_MM && v <= SENSOR_MAX_MM) {
-            out = v;
-            return true;
-          }
-        }
-      }
+  pingCount++;
+
+  // 1. Check if any packet is already in buffer (e.g. from Auto-Streaming)
+  if (checkUartPacket(out)) {
+    if (!sensorLocked) {
+      sensorLocked = true;
+      Serial.printf("[NODE] >>> SENSOR LOCKED! (Auto-Stream, Dist: %d mm) <<<\n", out);
     }
+    return true;
   }
 
-  // 2. Clear stale bytes before sending trigger
-  while (dypSerial.available()) dypSerial.read();
+  // 2. Send trigger (0x55 or 0x01) — DO NOT flush buffer!
+  uint8_t trig = (pingCount % 4 < 2) ? 0x55 : 0x01;
+  if (useSoftSerial) {
+    dypSoftSerial.write(trig);
+  } else {
+    dypSerial.write(trig);
+  }
 
-  // 3. Send trigger 0x55 (UART Controlled mode)
-  dypSerial.write(0x55);
-
-  // 4. Poll for up to 90ms for 4 bytes
+  // Poll for up to 70ms for response
   unsigned long t0 = millis();
-  while (dypSerial.available() < 4 && (millis() - t0 < 90)) {
+  while ((dypSerial.available() < 4 && dypSoftSerial.available() < 4) && (millis() - t0 < 70)) {
     delay(2);
   }
 
-  int avail = dypSerial.available();
-  if (avail >= 4) {
-    uint8_t d[32];
-    int n = min(avail, 32);
-    for (int i = 0; i < n; i++) d[i] = dypSerial.read();
-    for (int i = 0; i <= n - 4; i++) {
-      if (d[i] == 0xFF) {
-        uint8_t sum = (d[i] + d[i+1] + d[i+2]) & 0xFF;
-        if (sum == d[i+3]) {
-          uint16_t v = ((uint16_t)d[i+1] << 8) | d[i+2];
-          if (v >= SENSOR_MIN_MM && v <= SENSOR_MAX_MM) {
-            out = v;
-            return true;
-          }
-        }
-      }
+  // 3. Parse incoming packet
+  if (checkUartPacket(out)) {
+    if (!sensorLocked) {
+      sensorLocked = true;
+      Serial.printf("[NODE] >>> SENSOR LOCKED! (Trig 0x%02X, Dist: %d mm) <<<\n", trig, out);
     }
-    Serial.printf("[NODE] DYP data no valid checksum (got %d bytes): ", n);
-    for (int i = 0; i < n; i++) Serial.printf("0x%02X ", d[i]);
+    return true;
+  }
+
+  // Log any bytes received (even partial or non-0xFF)
+  int availH = dypSerial.available();
+  int availS = dypSoftSerial.available();
+  if (availH > 0 || availS > 0 || rxLen > 0) {
+    Serial.printf("[NODE-RAW] rxLen=%d availH=%d availS=%d (trig 0x%02X): ", rxLen, availH, availS, trig);
+    for (int i = 0; i < rxLen; i++) Serial.printf("%02X ", rxBuf[i]);
+    while (dypSerial.available()) Serial.printf("%02X ", dypSerial.read());
+    while (dypSoftSerial.available()) Serial.printf("%02X ", dypSoftSerial.read());
     Serial.println();
   }
+
+  // 4. If not locked and 6 seconds elapsed without ANY packet, try next config
+  if (!sensorLocked && (millis() - lastComboSwitch > 6000)) {
+    lastComboSwitch = millis();
+    // Cycle configs:
+    // 1. HW RX=D2, TX=D1, 9600
+    // 2. HW RX=D1, TX=D2, 9600
+    // 3. SW RX=D2, TX=D1, 9600
+    // 4. SW RX=D1, TX=D2, 9600
+    // 5. HW RX=D2, TX=D1, 115200
+    // 6. HW RX=D1, TX=D2, 115200
+    currentComb = (currentComb + 1) % 4;
+    int rx = (currentComb % 2 == 0) ? D2 : D1;
+    int tx = (currentComb % 2 == 0) ? D1 : D2;
+    useSoftSerial = (currentComb >= 2);
+    int baud = 9600;
+    setUartConfig(rx, tx, baud, useSoftSerial);
+  }
+
   return false;
 }
 
@@ -349,11 +430,6 @@ bool readMedian(uint16_t &out) {
     delay(15);
   }
   if (valid > 0) {
-    if (!pinLocked) {
-      pinLocked = true;
-      Serial.printf("[NODE] DYP Sensor LOCKED on %s!\n", pinComb == 0 ? "RX=D2, TX=D1" : "RX=D1, TX=D2");
-    }
-    zeroCycles = 0;
     if (valid == 1) {
       out = buf[0];
       return true;
@@ -362,17 +438,6 @@ bool readMedian(uint16_t &out) {
     out = buf[valid / 2];
     return true;
   }
-  
-  if (!pinLocked) {
-    zeroCycles++;
-    if (zeroCycles >= 6) { // After 6 failed cycles (~3.5 sec), try other pin combo
-      zeroCycles = 0;
-      pinComb = 1 - pinComb;
-      initSensorPins(pinComb);
-      Serial.printf("[NODE-PINS] Levels: D1(gpio%d)=%d D2(gpio%d)=%d\n",
-                    D1, gpio_get_level((gpio_num_t)D1), D2, gpio_get_level((gpio_num_t)D2));
-    }
-  }
   return false;
 }
 
@@ -380,8 +445,7 @@ void setup() {
   Serial.begin(115200);
   delay(500); // brief settle — do NOT block on Serial (no USB = infinite hang)
 
-  Serial.println("\n--- AQUAPULSE Node ---");
-  initSensorPins(0); // Start with user confirmed default: RX=D2, TX=D1
+  scanAndDetectSensor();
 
   // Always start on PAIRING_CHANNEL so hub can find us immediately
   currentChan = PAIRING_CHANNEL;
