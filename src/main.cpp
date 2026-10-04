@@ -61,16 +61,14 @@ typedef struct __attribute__((packed)) {
 #include <esp_now.h>
 #include <esp_wifi.h>
 #include <HardwareSerial.h>
-#include <SoftwareSerial.h>
 #include <Preferences.h>
 
-// User confirmed connections:
-// ESP32 TX: D1 (GPIO 3), connects to Sensor RX (White)
-// ESP32 RX: D2 (GPIO 4), connects to Sensor TX (Yellow)
-#define DYP_TX D1
-#define DYP_RX D2
+// Dynamic pin assignments per node:
+// Node 2 (MAC 1C:DB:D4:F0:5C:B4): D3 TX (Xiao TX -> Sensor RX), D4 RX (Xiao RX <- Sensor TX)
+// Node 1 (MAC E8:F6:0A:18:E7:70): D1 TX (Xiao TX -> Sensor RX), D2 RX (Xiao RX <- Sensor TX)
+uint8_t dypTxPin = D1;
+uint8_t dypRxPin = D2;
 HardwareSerial dypSerial(1);
-SoftwareSerial dypSoftSerial;
 
 uint8_t hubMAC[6];
 bool paired = false;
@@ -246,167 +244,83 @@ void OnDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
 #define EMA_ALPHA_NUM    25     // EMA weight = 25/100 (responsive yet smooth)
 #define EMA_ALPHA_DEN    100
 #define DEADBAND_MM      10     // suppress transmit unless changed by >10mm
-#define PLAUSIBLE_JUMP   300    // outlier threshold (mm)
-#define MAX_CONSECUTIVE_SPIKES 3 // accept step change after 3 consecutive readings
-#define SENSOR_MIN_MM    25     // DYP-A02 min range
+#define PLAUSIBLE_JUMP   100    // outlier threshold (mm) — catches multipath reflection dips
+#define MAX_CONSECUTIVE_SPIKES 8 // accept step change only after 8 consecutive readings (~4s)
+#define SENSOR_MIN_MM    30     // DYP-A02 min range (30 mm = 3 cm blind zone)
 #define SENSOR_MAX_MM    4500   // DYP-A02 max range
 #define HEARTBEAT_MS     2000   // Periodic heartbeat interval (ms)
+#define ECHO_LOST_CYCLES 10     // ~5s grace period before declaring echo lost (prevents momentary dropout dips)
 
 int16_t emaValue   = -1;
 int16_t lastSentMm = -1;
 int consecutiveSpikes = 0;
 
-static uint8_t rxBuf[64];
-static int rxLen = 0;
+void initSensorPins() {
+  // Node 2 (MAC 1C:DB:D4:F0:5C:B4): D3 TX, D4 RX
+  // Node 1 (MAC E8:F6:0A:18:E7:70): D1 TX, D2 RX
+  if (myMAC[0] == 0x1C && myMAC[1] == 0xDB) {
+    dypTxPin = D3;
+    dypRxPin = D4;
+  } else {
+    dypTxPin = D1;
+    dypRxPin = D2;
+  }
+  dypSerial.end();
+  delay(15);
+  dypSerial.begin(9600, SERIAL_8N1, dypRxPin, dypTxPin);
+  pinMode(dypRxPin, INPUT_PULLUP);
+  Serial.printf("[NODE] Sensor UART initialized (MAC %02X:%02X): RX=%s, TX=%s @ 9600 8N1\n",
+                myMAC[0], myMAC[1], dypRxPin == D4 ? "D4" : "D2", dypTxPin == D3 ? "D3" : "D1");
+}
 
-bool parseBuffer(uint8_t *buf, int len, uint16_t &out, int &consumed) {
-  for (int i = 0; i <= len - 4; i++) {
-    if (buf[i] == 0xFF) {
-      uint8_t sum = (buf[i] + buf[i+1] + buf[i+2]) & 0xFF;
-      if (sum == buf[i+3]) {
-        uint16_t v = ((uint16_t)buf[i+1] << 8) | buf[i+2];
-        consumed = i + 4;
-        if (v >= SENSOR_MIN_MM && v <= SENSOR_MAX_MM) {
-          out = v;
-          return true;
-        }
+// Clean, robust reading of 1 sample from the DYP sensor via UART
+bool readRaw(uint16_t &out) {
+  // 1. Discard leading non-0xFF noise bytes from FIFO
+  int stale = 0;
+  while (dypSerial.available() > 0 && dypSerial.peek() != 0xFF) {
+    dypSerial.read();
+    stale++;
+  }
+
+  // 2. If no complete frame is ready, send trigger 0x55 and wait for response
+  if (dypSerial.available() < 4) {
+    dypSerial.write(0x55);
+    unsigned long t0 = millis();
+    while (dypSerial.available() < 4 && (millis() - t0 < 100)) {
+      delay(2);
+    }
+  }
+
+  int avail = dypSerial.available();
+
+  // 3. Align again to 0xFF frame header
+  while (dypSerial.available() > 0 && dypSerial.peek() != 0xFF) {
+    dypSerial.read();
+  }
+
+  // 4. Validate complete 4-byte frame: [0xFF, Data_H, Data_L, Checksum]
+  if (dypSerial.available() >= 4) {
+    uint8_t h   = dypSerial.read(); // 0xFF
+    uint8_t d_h = dypSerial.read();
+    uint8_t d_l = dypSerial.read();
+    uint8_t sum = dypSerial.read();
+    if (((h + d_h + d_l) & 0xFF) == sum) {
+      uint16_t v = ((uint16_t)d_h << 8) | d_l;
+      if (v >= SENSOR_MIN_MM && v <= SENSOR_MAX_MM) {
+        out = v;
+        return true;
       }
     }
   }
-  consumed = 0;
-  return false;
-}
 
-bool checkUartPacket(uint16_t &out) {
-  while (dypSerial.available() && rxLen < (int)sizeof(rxBuf)) {
-    rxBuf[rxLen++] = dypSerial.read();
+  static unsigned long lastDiag = 0;
+  if (millis() - lastDiag > 2500) {
+    lastDiag = millis();
+    Serial.printf("[NODE-DIAG] avail=%d stale=%d TX(%s)=%d RX(%s)=%d\n",
+                  avail, stale,
+                  dypTxPin == D3 ? "D3" : "D1", digitalRead(dypTxPin),
+                  dypRxPin == D4 ? "D4" : "D2", digitalRead(dypRxPin));
   }
-  while (dypSoftSerial.available() && rxLen < (int)sizeof(rxBuf)) {
-    rxBuf[rxLen++] = dypSoftSerial.read();
-  }
-
-  int consumed = 0;
-  if (parseBuffer(rxBuf, rxLen, out, consumed)) {
-    rxLen -= consumed;
-    if (rxLen > 0) memmove(rxBuf, rxBuf + consumed, rxLen);
-    return true;
-  }
-  // Drop leading bytes that are not 0xFF
-  while (rxLen > 0 && rxBuf[0] != 0xFF) {
-    rxLen--;
-    if (rxLen > 0) memmove(rxBuf, rxBuf + 1, rxLen);
-  }
-  return false;
-}
-
-// Clean, stable UART communication for DYP-A02YYTW
-static int currentComb = 0; // 0 = RX:D2 TX:D1, 1 = RX:D1 TX:D2
-static bool useSoftSerial = false;
-static int currentBaudIdx = 0;
-static const int BAUD_RATES[] = {9600, 115200};
-static const int NUM_BAUDS = sizeof(BAUD_RATES) / sizeof(BAUD_RATES[0]);
-
-static unsigned long lastComboSwitch = 0;
-static bool sensorLocked = false;
-static int lockRxPin = D2;
-static int lockTxPin = D1;
-
-void setUartConfig(int rxPin, int txPin, int baud, bool soft) {
-  dypSerial.end();
-  dypSoftSerial.end();
-  delay(30);
-  rxLen = 0;
-
-  if (soft) {
-    dypSoftSerial.begin(baud, SWSERIAL_8N1, rxPin, txPin, false);
-    gpio_pullup_en((gpio_num_t)rxPin);
-    Serial.printf("[NODE-UART] Config: SoftwareSerial RX=D%d(gpio%d), TX=D%d(gpio%d) @ %d baud\n",
-                  (rxPin == D2 ? 2 : 1), rxPin, (txPin == D1 ? 1 : 2), txPin, baud);
-  } else {
-    dypSerial.begin(baud, SERIAL_8N1, rxPin, txPin);
-    gpio_pullup_en((gpio_num_t)rxPin);
-    Serial.printf("[NODE-UART] Config: HardwareSerial RX=D%d(gpio%d), TX=D%d(gpio%d) @ %d baud\n",
-                  (rxPin == D2 ? 2 : 1), rxPin, (txPin == D1 ? 1 : 2), txPin, baud);
-  }
-}
-
-void scanAndDetectSensor() {
-  Serial.println("\n==========================================");
-  Serial.println("[NODE] DYP SENSOR STARTUP");
-  Serial.println("==========================================");
-  currentComb = 0; // Default: RX=D2, TX=D1
-  useSoftSerial = false;
-  currentBaudIdx = 0; // 9600
-  setUartConfig(D2, D1, 9600, false);
-  lastComboSwitch = millis();
-}
-
-static int pingCount = 0;
-
-bool readRaw(uint16_t &out) {
-  pingCount++;
-
-  // 1. Check if any packet is already in buffer (e.g. from Auto-Streaming)
-  if (checkUartPacket(out)) {
-    if (!sensorLocked) {
-      sensorLocked = true;
-      Serial.printf("[NODE] >>> SENSOR LOCKED! (Auto-Stream, Dist: %d mm) <<<\n", out);
-    }
-    return true;
-  }
-
-  // 2. Send trigger (0x55 or 0x01) — DO NOT flush buffer!
-  uint8_t trig = (pingCount % 4 < 2) ? 0x55 : 0x01;
-  if (useSoftSerial) {
-    dypSoftSerial.write(trig);
-  } else {
-    dypSerial.write(trig);
-  }
-
-  // Poll for up to 70ms for response
-  unsigned long t0 = millis();
-  while ((dypSerial.available() < 4 && dypSoftSerial.available() < 4) && (millis() - t0 < 70)) {
-    delay(2);
-  }
-
-  // 3. Parse incoming packet
-  if (checkUartPacket(out)) {
-    if (!sensorLocked) {
-      sensorLocked = true;
-      Serial.printf("[NODE] >>> SENSOR LOCKED! (Trig 0x%02X, Dist: %d mm) <<<\n", trig, out);
-    }
-    return true;
-  }
-
-  // Log any bytes received (even partial or non-0xFF)
-  int availH = dypSerial.available();
-  int availS = dypSoftSerial.available();
-  if (availH > 0 || availS > 0 || rxLen > 0) {
-    Serial.printf("[NODE-RAW] rxLen=%d availH=%d availS=%d (trig 0x%02X): ", rxLen, availH, availS, trig);
-    for (int i = 0; i < rxLen; i++) Serial.printf("%02X ", rxBuf[i]);
-    while (dypSerial.available()) Serial.printf("%02X ", dypSerial.read());
-    while (dypSoftSerial.available()) Serial.printf("%02X ", dypSoftSerial.read());
-    Serial.println();
-  }
-
-  // 4. If not locked and 6 seconds elapsed without ANY packet, try next config
-  if (!sensorLocked && (millis() - lastComboSwitch > 6000)) {
-    lastComboSwitch = millis();
-    // Cycle configs:
-    // 1. HW RX=D2, TX=D1, 9600
-    // 2. HW RX=D1, TX=D2, 9600
-    // 3. SW RX=D2, TX=D1, 9600
-    // 4. SW RX=D1, TX=D2, 9600
-    // 5. HW RX=D2, TX=D1, 115200
-    // 6. HW RX=D1, TX=D2, 115200
-    currentComb = (currentComb + 1) % 4;
-    int rx = (currentComb % 2 == 0) ? D2 : D1;
-    int tx = (currentComb % 2 == 0) ? D1 : D2;
-    useSoftSerial = (currentComb >= 2);
-    int baud = 9600;
-    setUartConfig(rx, tx, baud, useSoftSerial);
-  }
-
   return false;
 }
 
@@ -418,7 +332,7 @@ void sortArr(uint16_t *a, int n) {
   }
 }
 
-// Take MEDIAN_SAMPLES readings, return median
+// Take MEDIAN_SAMPLES readings, return median with track affinity and noise rejection
 bool readMedian(uint16_t &out) {
   uint16_t buf[MEDIAN_SAMPLES];
   int valid = 0;
@@ -427,17 +341,47 @@ bool readMedian(uint16_t &out) {
     if (readRaw(v)) {
       buf[valid++] = v;
     }
-    delay(15);
+    // 80ms interval ensures compliance with DYP-A02 datasheet (>70ms) allowing boost capacitor to recharge
+    delay(80);
   }
-  if (valid > 0) {
-    if (valid == 1) {
-      out = buf[0];
+
+  if (valid == 0) return false;
+
+  // 1. Track affinity: if already tracking a surface (emaValue > 0),
+  // prefer samples consistent with active level (rejects side-lobe reflections like 1314mm vs 1635mm)
+  if (emaValue > 0) {
+    uint32_t trackSum = 0;
+    int trackCount = 0;
+    for (int i = 0; i < valid; i++) {
+      if (abs((int)buf[i] - (int)emaValue) <= 100) {
+        trackSum += buf[i];
+        trackCount++;
+      }
+    }
+    if (trackCount >= 2) {
+      out = (uint16_t)(trackSum / trackCount);
       return true;
     }
+  }
+
+  // 2. Multi-sample consistency: require at least 2 readings within 100mm
+  // (Prevents single-spike false positives like 256mm from latching)
+  if (valid >= 2) {
     sortArr(buf, valid);
-    out = buf[valid / 2];
+    for (int j = 0; j < valid - 1; j++) {
+      if (abs((int)buf[j+1] - (int)buf[j]) <= 100) {
+        out = buf[valid / 2];
+        return true;
+      }
+    }
+  }
+
+  // 3. If locked and single sample matches established track within 100mm, accept it
+  if (valid == 1 && emaValue > 0 && abs((int)buf[0] - (int)emaValue) <= 100) {
+    out = buf[0];
     return true;
   }
+
   return false;
 }
 
@@ -445,7 +389,7 @@ void setup() {
   Serial.begin(115200);
   delay(500); // brief settle — do NOT block on Serial (no USB = infinite hang)
 
-  scanAndDetectSensor();
+  Serial.println("\n--- AQUAPULSE Node ---");
 
   // Always start on PAIRING_CHANNEL so hub can find us immediately
   currentChan = PAIRING_CHANNEL;
@@ -454,6 +398,8 @@ void setup() {
   esp_wifi_set_channel(PAIRING_CHANNEL, WIFI_SECOND_CHAN_NONE);
   WiFi.macAddress(myMAC);
   Serial.print("[NODE] MAC: "); printMAC(myMAC); Serial.println();
+
+  initSensorPins();
 
   if (esp_now_init() != ESP_OK) {
     Serial.println("[NODE] ESP-NOW init failed - restarting");
@@ -512,17 +458,21 @@ void loop() {
   if (paired) {
     uint16_t median;
     bool hasReading = readMedian(median);
-    
+    static int missingEchoCycles = 0;
+
     if (hasReading) {
+      missingEchoCycles = 0;
       // Seed EMA on first reading
       if (emaValue < 0) {
         emaValue = (int16_t)median;
         consecutiveSpikes = 0;
+        Serial.printf("[NODE] Initial surface locked: %d mm\n", emaValue);
       } else {
         // Plausibility check
         if (abs((int)median - (int)emaValue) > PLAUSIBLE_JUMP) {
           consecutiveSpikes++;
-          Serial.printf("[NODE] Jump detected: median=%d  EMA=%d [#%d]\n", median, emaValue, consecutiveSpikes);
+          Serial.printf("[NODE] Jump filtered: median=%d  EMA=%d [#%d/%d]\n",
+                        median, emaValue, consecutiveSpikes, MAX_CONSECUTIVE_SPIKES);
           // If consecutive readings maintain the new level, accept it as real step change
           if (consecutiveSpikes >= MAX_CONSECUTIVE_SPIKES) {
             Serial.printf("[NODE] Step change confirmed -> new level: %d mm\n", median);
@@ -536,6 +486,13 @@ void loop() {
         }
       }
     } else {
+      missingEchoCycles++;
+      // If echo lost continuously for ECHO_LOST_CYCLES (~5s), clear EMA so offline is reported
+      if (missingEchoCycles >= ECHO_LOST_CYCLES && emaValue > 0) {
+        Serial.printf("[NODE] Echo lost (%d cycles) -> cleared EMA %d mm\n", missingEchoCycles, emaValue);
+        emaValue = -1;
+        lastSentMm = -1;
+      }
       static unsigned long lastWarn = 0;
       if (millis() - lastWarn > 3000) {
         lastWarn = millis();
@@ -544,21 +501,25 @@ void loop() {
     }
 
     // Determine if we should transmit:
-    // 1. If distance changed by > DEADBAND_MM (and we have a valid reading)
+    // 1. If distance changed by > DEADBAND_MM (and we have an active reading)
     // 2. OR periodic heartbeat every HEARTBEAT_MS (2000ms) so Hub never times out!
-    bool valueChanged = (emaValue > 0 && (lastSentMm < 0 || abs((int)emaValue - (int)lastSentMm) > DEADBAND_MM));
+    bool valueChanged = (hasReading && emaValue > 0 && (lastSentMm < 0 || abs((int)emaValue - (int)lastSentMm) > DEADBAND_MM));
     bool heartbeatDue = (millis() - lastSend >= HEARTBEAT_MS);
 
     if (valueChanged || heartbeatDue) {
       SensorData data;
       data.deviceId  = myDeviceId;
-      data.distance  = (emaValue > 0) ? emaValue : (hasReading ? (int)median : -1);
+      // Send smoothed EMA (held during grace period); if echo is truly lost/offline send -1
+      data.distance  = (emaValue > 0) ? emaValue : -1;
       data.timestamp = millis();
       esp_err_t result = esp_now_send(hubMAC, (uint8_t *)&data, sizeof(SensorData));
       if (result == ESP_OK) {
         lastSend = millis();
-        if (emaValue > 0) lastSentMm = emaValue;
-        Serial.printf("[NODE] TX: SensorData (Dist: %d mm, raw=%d mm)\n", data.distance, hasReading ? median : -1);
+        if (data.distance > 0) lastSentMm = data.distance;
+        Serial.printf("[NODE] TX: SensorData (Dist: %.2f m [%d mm], raw=%s)\n",
+                      data.distance > 0 ? data.distance / 1000.0 : -1.0,
+                      data.distance,
+                      hasReading ? (String(median / 1000.0, 2) + " m").c_str() : "-1");
       } else {
         sendFailures++;
         Serial.printf("[NODE] Send fail #%d\n", sendFailures);
@@ -595,6 +556,7 @@ String hubSSID = "";
 String hubPASS = "";
 const byte DNS_PORT = 53;
 void drawDisplay(bool fullRedraw);
+void drawHeader();
 void drawPage0(bool fullRedraw);
 void drawPage1(bool fullRedraw);
 void drawStatusBar(bool fullRedraw);
@@ -672,28 +634,57 @@ unsigned long lastStartupBeacon = 0;
 // ── Buzzer (pin 26, MMBT2222A NPN — HIGH = on) ───────────────────────────────
 #define TRANSISTOR_PIN 26
 // Beep pattern state (non-blocking)
-bool     buzzerAlert   = false;   // true when at least one node is below threshold
-bool     buzzerOn      = false;   // current transistor state
-unsigned long buzzerLast = 0;
-int      buzzerPhase   = 0;       // cycles through ON/OFF timing
+bool          buzzerAlert     = false; // true when at least one node is below threshold
+bool          buzzerDismissed = false; // true when user dismissed/muted the active alert
+bool          buzzerOn        = false; // current transistor state
+unsigned long buzzerLast      = 0;
+int           buzzerPhase     = 0;     // 0 = 1s blast (ON), 1 = 0.5s pause (OFF)
 
 // Call this from loop() — drives the buzzer without delay()
+// Pattern: 1 sec blast -> 0.5 sec pause -> repeat
 void updateBuzzer() {
-  if (!buzzerAlert) {
-    if (buzzerOn) { digitalWrite(TRANSISTOR_PIN, LOW); buzzerOn = false; }
+  if (!buzzerAlert || buzzerDismissed) {
+    if (buzzerOn) {
+      digitalWrite(TRANSISTOR_PIN, LOW);
+      buzzerOn = false;
+    }
     buzzerPhase = 0;
+    buzzerLast = 0;
     return;
   }
-  // Pattern: 100ms ON → 100ms OFF → 100ms ON → 700ms OFF (double-beep every ~1s)
-  static const uint16_t pattern[] = {100, 100, 100, 700};
+
+  // Pattern: 1000ms ON (blast) -> 500ms OFF (pause)
+  static const uint16_t pattern[] = {1000, 500};
   unsigned long now = millis();
+
+  // If entering alert state fresh, start the 1s blast immediately
+  if (buzzerLast == 0) {
+    buzzerLast = now;
+    buzzerPhase = 0;
+    buzzerOn = true;
+    digitalWrite(TRANSISTOR_PIN, HIGH);
+    return;
+  }
+
   if (now - buzzerLast >= pattern[buzzerPhase]) {
     buzzerLast = now;
-    buzzerPhase = (buzzerPhase + 1) % 4;
-    bool shouldBeOn = (buzzerPhase == 0 || buzzerPhase == 2); // phases 0,2 = ON
-    buzzerOn = shouldBeOn;
+    buzzerPhase = (buzzerPhase + 1) % 2;
+    buzzerOn = (buzzerPhase == 0); // phase 0 = 1000ms ON, phase 1 = 500ms OFF
     digitalWrite(TRANSISTOR_PIN, buzzerOn ? HIGH : LOW);
   }
+}
+
+// Audible buzzer test routine: 1s blast -> 0.5s pause -> 1s blast
+void triggerBuzzerTest() {
+  Serial.println("[HUB] Buzzer Test: sounding 1s blast -> 0.5s pause -> 1s blast...");
+  digitalWrite(TRANSISTOR_PIN, HIGH);
+  delay(1000);
+  digitalWrite(TRANSISTOR_PIN, LOW);
+  delay(500);
+  digitalWrite(TRANSISTOR_PIN, HIGH);
+  delay(1000);
+  digitalWrite(TRANSISTOR_PIN, LOW);
+  Serial.println("[HUB] Buzzer Test: complete.");
 }
 
 // ── NVS (Preferences) for paired node MACs & Calibration ────────────────────
@@ -721,9 +712,13 @@ void hubLoadCalibration() {
                 tankEmptyMm, tankFullMm, alertThreshold, sensorOffsetMm);
 }
 
-// Check all nodes — update buzzerAlert flag
+// Global lowest percentage among nodes currently in alert state
+int currentAlertPercent = 100;
+
+// Check all nodes — update buzzerAlert flag & calculate alert percentage
 void checkAlerts() {
   bool anyAlert = false;
+  int minAlertPct = 100;
   for (int i = 0; i < MAX_NODES; i++) {
     if (!nodes[i].paired) continue;
     if (millis() - nodes[i].lastRecvTime > 15000) continue; // skip offline
@@ -731,9 +726,25 @@ void checkAlerts() {
     int dist = constrain(nodes[i].distance + sensorOffsetMm, 0, 5000);
     int pct = map(dist, tankEmptyMm, tankFullMm, 0, 100);
     pct = constrain(pct, 0, 100);
-    if (pct < alertThreshold) { anyAlert = true; break; }
+    if (pct <= alertThreshold) {
+      anyAlert = true;
+      if (pct < minAlertPct) minAlertPct = pct;
+    }
   }
-  buzzerAlert = anyAlert;
+  if (!anyAlert) {
+    buzzerDismissed = false; // automatically re-arm alarm when water level recovers
+    currentAlertPercent = 100;
+  } else {
+    currentAlertPercent = (minAlertPct <= 100) ? minAlertPct : alertThreshold;
+  }
+  static int lastAlertPct = -1;
+  static bool lastDismissed = false;
+  if (anyAlert != buzzerAlert || (anyAlert && currentAlertPercent != lastAlertPct) || buzzerDismissed != lastDismissed) {
+    buzzerAlert = anyAlert;
+    lastAlertPct = currentAlertPercent;
+    lastDismissed = buzzerDismissed;
+    if (!inMenu) drawHeader(); // Update header to display new alert/silence button with percentage
+  }
 }
 
 void hubSaveNodes() {
@@ -777,6 +788,7 @@ int activeNodeCount() {
   return c;
 }
 int currentPage = 0; // 0 = Number Grid, 1 = Visual Tanks
+int lastRenderedPage = -1; // tracks page changes to eliminate screen bleeding
 bool forceRedraw = true;
 
 void setBrightness(int level) {
@@ -797,8 +809,9 @@ void OnDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
 
   if (len == sizeof(SensorData)) {
     SensorData *data = (SensorData *)incomingData;
-    Serial.printf("[HUB] RX: Received SensorData from %02X:%02X:%02X:%02X:%02X:%02X -> Dist: %d mm\n",
-                  mac[0],mac[1],mac[2],mac[3],mac[4],mac[5], data->distance);
+    Serial.printf("[HUB] RX: Received SensorData from %02X:%02X:%02X:%02X:%02X:%02X -> Dist: %.2f m (%d mm)\n",
+                  mac[0],mac[1],mac[2],mac[3],mac[4],mac[5],
+                  data->distance >= 0 ? data->distance / 1000.0 : -1.0, data->distance);
     for (int i = 0; i < MAX_NODES; i++) {
       if (nodes[i].paired && memcmp(nodes[i].mac, mac, 6) == 0) {
         // ── Known paired node: update data ──
@@ -875,6 +888,28 @@ void drawHeader() {
   tft.setCursor(6, 8);
   tft.print("AQUAPULSE");
   tft.drawFastHLine(0, 31, 320, COLOR_ACCENT);
+
+  // Dismiss / Silence Buzzer button when buzzer is alerting
+  // When buzzing: BRIGHT RED button [SILENCE XX%]
+  // When pressed / silenced: BLUE button [SILENCED XX%]
+  if (buzzerAlert) {
+    char label[20];
+    uint16_t btnColor;
+    if (!buzzerDismissed) {
+      sprintf(label, "SILENCE %d%%", currentAlertPercent);
+      btnColor = COLOR_RED; // BRIGHT RED when actively buzzing
+    } else {
+      sprintf(label, "SILENCED %d%%", currentAlertPercent);
+      btnColor = COLOR_BLUE; // Changes to BLUE when pressed/silenced!
+    }
+
+    tft.fillRoundRect(124, 3, 128, 26, 5, btnColor);
+    tft.setTextColor(COLOR_WHITE, btnColor);
+    tft.setTextSize(1);
+    int textW = strlen(label) * 6;
+    tft.setCursor(124 + (128 - textW) / 2, 12);
+    tft.print(label);
+  }
 
   // Menu Button — top-right
   tft.fillRoundRect(258, 4, 58, 24, 4, COLOR_DARK_GRAY);
@@ -1089,8 +1124,8 @@ void drawMenu() {
     tft.setCursor(229, bY + 28); tft.print("CAL");
 
     // BACK button (y=148..190)
-    tft.fillRoundRect(8, 148, 304, 38, 6, COLOR_BLUE);
-    tft.setTextColor(COLOR_WHITE);
+    tft.fillRoundRect(8, 148, 304, 38, 6, COLOR_RED);
+    tft.setTextColor(COLOR_WHITE, COLOR_RED);
     tft.setTextSize(2);
     tft.setCursor(134, 157);
     tft.print("BACK");
@@ -1238,11 +1273,11 @@ void drawMenu() {
       tft.print("-");
     }
 
-    // BACK button
-    tft.fillRoundRect(8, 184, 304, 36, 6, COLOR_BLUE);
-    tft.setTextColor(COLOR_WHITE);
+    // BACK button (all changes auto-save immediately to NVS)
+    tft.fillRoundRect(8, 184, 304, 36, 6, COLOR_RED);
+    tft.setTextColor(COLOR_WHITE, COLOR_RED);
     tft.setTextSize(2);
-    tft.setCursor(134, 193);
+    tft.setCursor(134, 194);
     tft.print("BACK");
   }
 
@@ -1273,8 +1308,8 @@ void drawMenu() {
     tft.print("Uptime (s): "); tft.print(millis()/1000);
 
     // BACK button
-    tft.fillRoundRect(8, 160, 304, 38, 6, COLOR_BLUE);
-    tft.setTextColor(COLOR_WHITE);
+    tft.fillRoundRect(8, 160, 304, 38, 6, COLOR_RED);
+    tft.setTextColor(COLOR_WHITE, COLOR_RED);
     tft.setTextSize(2);
     tft.setCursor(134, 172);
     tft.print("BACK");
@@ -1368,14 +1403,26 @@ void handleTouch() {
           return;
         }
         if (!inMenu) {
-          // MENU button is now at x=258..316, y=4..28 (header)
-          if (startX > 258 && startY < 32) {
+          // 1. DISMISS BUZZER button in header (x=130..254, y=0..32)
+          if (buzzerAlert && startX >= 122 && startX <= 254 && startY <= 32) {
+            buzzerDismissed = !buzzerDismissed;
+            if (buzzerDismissed) {
+              digitalWrite(TRANSISTOR_PIN, LOW);
+              buzzerOn = false;
+            } else {
+              buzzerLast = 0; // restart blast if unmuted
+            }
+            drawHeader();
+            return;
+          }
+          // 2. MENU button (x=258..316, y=0..32)
+          else if (startX > 258 && startY < 32) {
             inMenu = true;
             currentMenuPage = 0;
             drawMenu();
           }
-          // Secret menu (double tap on logo x=0..150, y=0..32)
-          else if (startX < 180 && startY < 40) {
+          // 3. Secret menu (double tap on logo x=0..120, y=0..32)
+          else if (startX < 120 && startY < 32) {
             static unsigned long lastTap = 0;
             if (millis() - lastTap < 1000 && lastTap > 0) {
               inMenu = true;
@@ -1385,6 +1432,12 @@ void handleTouch() {
             } else {
               lastTap = millis();
             }
+          }
+          // 4. Tap on status bar / page dots (y >= 210) toggles page cleanly
+          else if (startY >= 210) {
+            currentPage = (currentPage == 0) ? 1 : 0;
+            drawDisplay(true);
+            return;
           }
         } else {
           if (currentMenuPage == 0) {
@@ -1408,7 +1461,7 @@ void handleTouch() {
               inMenu = false;
               isPairingMode = false;
               tft.fillScreen(COLOR_BG);
-              drawHeader();
+              lastRenderedPage = -1;
               drawDisplay(true);
               forceRedraw = false;
             }
@@ -1433,7 +1486,14 @@ void handleTouch() {
                 nodes[i].paired = false;
                 nodes[i].distance = -1;
               }
-              hubPrefs.begin("hub", false); hubPrefs.clear(); hubPrefs.end(); // clear NVS
+              // Clear only paired node keys in NVS — DO NOT wipe calibration or WiFi!
+              hubPrefs.begin("hub", false);
+              hubPrefs.putInt("count", 0);
+              for (int k = 0; k < MAX_NODES; k++) {
+                char kName[10]; sprintf(kName, "mac%d", k);
+                hubPrefs.remove(kName);
+              }
+              hubPrefs.end();
               invalidateCache = true;
               isPairingMode = false;
               drawMenu();
@@ -1517,8 +1577,8 @@ void handleTouch() {
                 }
               }
             }
-            // BACK (y=180..230)
-            if (startY > 180 && startY < 230) {
+            // BACK button (y=180..230) — auto-saves to NVS and returns
+            if (startY >= 180 && startY <= 230) {
               hubSaveCalibration();
               currentMenuPage = 0;
               drawMenu();
@@ -1557,9 +1617,7 @@ void handleTouch() {
               tft.setCursor(95, 66);
               tft.print("TEST BUZZER");
               
-              digitalWrite(TRANSISTOR_PIN, HIGH);
-              delay(500); // Test beep
-              digitalWrite(TRANSISTOR_PIN, LOW);
+              triggerBuzzerTest();
               
               drawMenu(); // restore original button color
             }
@@ -1571,12 +1629,12 @@ void handleTouch() {
           }
         }
       } else if (!inMenu && duration < 500) {
-        if (dx > 50) {
+        if (dx > 40) {
           currentPage = (currentPage == 1) ? 0 : 1;
-          forceRedraw = true;
-        } else if (dx < -50) {
+          drawDisplay(true);
+        } else if (dx < -40) {
           currentPage = (currentPage == 0) ? 1 : 0;
-          forceRedraw = true;
+          drawDisplay(true);
         }
       }
     }
@@ -1612,13 +1670,15 @@ String getDashboardHTML() {
       html += "<div class='tank'><h3>Node " + String(i+1) + "</h3>";
       long rawD = nodes[i].distance;
       if (rawD == -1 || offline) {
-         html += "<p style='color:#f87171'>" + String(offline ? "OFFLINE" : "-- mm") + "</p>";
+         html += "<p style='color:#f87171'>" + String(offline ? "OFFLINE" : "-- m") + "</p>";
       } else {
          long d = constrain(rawD + sensorOffsetMm, 0, 5000);
-         html += "<p>Dist: " + String(d) + " mm</p>";
+         html += "<p style='font-size:16px;'>Dist: <b>" + String(d / 1000.0, 2) + " m</b> (" + String(d) + " mm)</p>";
          int pct = map(d, tankEmptyMm, tankFullMm, 0, 100);
          pct = constrain(pct, 0, 100);
-         html += "<p style='font-size:24px;font-weight:bold;color:#38bdf8'>" + String(pct) + "%</p>";
+         bool isAlert = (pct <= alertThreshold);
+         String pctColor = isAlert ? "#ef4444" : (pct < 50 ? "#f59e0b" : "#22c55e");
+         html += "<p style='font-size:24px;font-weight:bold;color:" + pctColor + "'>" + String(pct) + "%" + (isAlert ? " <span style='font-size:12px;background:#ef4444;color:#fff;padding:2px 6px;border-radius:4px;'>ALERT</span>" : "") + "</p>";
       }
       html += "</div>";
     }
@@ -1631,6 +1691,16 @@ String getDashboardHTML() {
   html += "<label>Sensor Distance Offset (mm):</label><input type='number' name='offset' value='" + String(sensorOffsetMm) + "'>";
   html += "<label>Alert Threshold (%):</label><input type='number' name='alert' value='" + String(alertThreshold) + "'>";
   html += "<button type='submit'>Save Calibration</button></form></div>";
+  html += "<div class='card'><h3>Hardware Diagnostics & Alarm</h3>";
+  html += "<button type='button' style='background:#f59e0b;padding:10px 16px;border:none;border-radius:5px;color:white;font-weight:bold;cursor:pointer;' onclick=\"fetch('/testbuzzer').then(()=>alert('Buzzer test triggered!'))\">🔊 Test Hub Buzzer</button>";
+  if (buzzerAlert) {
+    if (!buzzerDismissed) {
+      html += "<button type='button' style='background:#ef4444;margin-left:12px;padding:10px 16px;border:none;border-radius:5px;color:white;font-weight:bold;cursor:pointer;' onclick=\"fetch('/dismissbuzzer').then(()=>location.reload())\">🔕 Silence Buzzer (" + String(currentAlertPercent) + "%)</button>";
+    } else {
+      html += "<button type='button' style='background:#2563eb;margin-left:12px;padding:10px 16px;border-radius:5px;color:white;font-weight:bold;cursor:pointer;border:none;' onclick=\"fetch('/dismissbuzzer').then(()=>location.reload())\">🔔 Silenced (" + String(currentAlertPercent) + "%) - Unmute</button>";
+    }
+  }
+  html += "</div>";
   html += "<br><a href='/pairing' style='color:#38bdf8'>Pairing Mode</a>";
   html += "</body></html>";
   return html;
@@ -1678,7 +1748,7 @@ void drawQRCode(const char *text, const char *title) {
 
 
 uint16_t getDistColor(int percent) {
-  if (percent < alertThreshold) return COLOR_RED;
+  if (percent <= alertThreshold) return COLOR_RED;
   if (percent < 50) return COLOR_ORANGE;
   return COLOR_ACCENT;
 }
@@ -1748,18 +1818,46 @@ void updatePage0() {
         continue;
     }
     
-    uint16_t pColor = getDistColor(percent);
+    bool isAlerting = nodes[i].paired && !offline && (dist != -1) && (percent <= alertThreshold);
 
+    uint16_t pctColor;
+    if (dist == -1) {
+      pctColor = COLOR_DARK_GRAY;
+    } else if (isAlerting) {
+      pctColor = COLOR_RED; // BRIGHT RED for the tank causing the alert!
+    } else if (percent < 50) {
+      pctColor = COLOR_ORANGE;
+    } else {
+      pctColor = COLOR_ACCENT; // Green
+    }
+
+    // Card background
+    tft.fillRoundRect(x, y, 156, 80, 6, COLOR_DARK_GRAY);
+
+    // If this tank is causing the alert, highlight with a BRIGHT RED double border!
+    if (isAlerting) {
+      tft.drawRoundRect(x, y, 156, 80, 6, COLOR_RED);
+      tft.drawRoundRect(x+1, y+1, 154, 78, 5, COLOR_RED);
+    }
+
+    // Node header: RED if alerting, else CYAN
     tft.setTextSize(2);
-    tft.setTextColor(pColor, COLOR_DARK_GRAY);
+    tft.setTextColor(isAlerting ? COLOR_RED : COLOR_CYAN, COLOR_DARK_GRAY);
+    tft.setCursor(x+4, y+4);
+    tft.print("Node "); tft.print(i + 1);
+
+    // Distance
+    tft.setTextSize(2);
+    tft.setTextColor(dist == -1 ? COLOR_DARK_GRAY : (isAlerting ? COLOR_RED : COLOR_CYAN), COLOR_DARK_GRAY);
     tft.setCursor(x+4, y+28);
     char buf[16];
     if (dist == -1) sprintf(buf, "--    ");
-    else sprintf(buf, "%d mm   ", dist);
+    else sprintf(buf, "%.2f m  ", dist / 1000.0);
     tft.print(buf);
 
+    // Percentage: BRIGHT RED for tank causing alert!
     tft.setTextSize(3);
-    tft.setTextColor(pColor, COLOR_DARK_GRAY);
+    tft.setTextColor(pctColor, COLOR_DARK_GRAY);
     tft.setCursor(x+4, y+50);
     if (dist == -1) sprintf(buf, "--%%   ");
     else sprintf(buf, "%d%%   ", percent);
@@ -1769,8 +1867,8 @@ void updatePage0() {
 
 void drawPage0(bool fullRedraw) {
   if (fullRedraw) {
-    tft.fillRect(0, 32, 320, 208, COLOR_BG);
-    int cellW = 156, cellH = 100;
+    tft.fillRect(0, 32, 320, 188, COLOR_BG);
+    int cellW = 156, cellH = 80;
     int xs[] = {2, 162, 2, 162};
     int ys[] = {34, 34, 137, 137};
     
@@ -1791,10 +1889,14 @@ void drawPage0(bool fullRedraw) {
 
 // ── Helper: draw one tank cell cleanly ─────────────────────────────────────
 void drawTankCell(int x, int y, int tankW, int tankH, int percent, bool paired, bool offline, int nodeIdx) {
-  uint16_t fillColor = getDistColor(percent);
+  int rawDist = nodes[nodeIdx].distance;
+  int dist = rawDist != -1 ? constrain(rawDist + sensorOffsetMm, 0, 5000) : -1;
+  bool isAlerting = paired && !offline && (dist != -1) && (percent <= alertThreshold);
 
-  // Outer border (rounded rect, always redrawn cleanly)
-  uint16_t borderColor = offline ? COLOR_RED : (paired ? fillColor : COLOR_DARK_GRAY);
+  uint16_t fillColor = (dist == -1) ? COLOR_DARK_GRAY : (isAlerting ? COLOR_RED : getDistColor(percent));
+
+  // Outer border: BRIGHT RED for tank causing alert!
+  uint16_t borderColor = offline ? COLOR_RED : (isAlerting ? COLOR_RED : (paired && dist != -1 ? fillColor : COLOR_DARK_GRAY));
   tft.drawRoundRect(x, y, tankW, tankH, 5, borderColor);
   tft.drawRoundRect(x+1, y+1, tankW-2, tankH-2, 4, borderColor); // double border for thickness
 
@@ -1847,7 +1949,11 @@ void updatePage1() {
   static int  lastPercent[4] = {-1, -1, -1, -1};
 
   if (invalidateCache) {
-    for (int i = 0; i < 4; i++) { lastPaired[i] = -1; lastPercent[i] = -99; }
+    for (int i = 0; i < 4; i++) {
+      lastPaired[i] = !nodes[i].paired;
+      lastOffline[i] = false;
+      lastPercent[i] = -999;
+    }
   }
 
   // Layout: up to 4 tanks side by side
@@ -1898,23 +2004,35 @@ void updatePage1() {
     tft.setCursor(x + tankW/2 - 18, y - 14);
     tft.print("NODE "); tft.print(i+1);
 
-    // Percentage below tank
-    tft.fillRect(x, y + tankH + 2, tankW, 14, COLOR_BG);
-    tft.setTextSize(1);
-    uint16_t col = nodes[i].paired && !offline ? getDistColor(percent) : COLOR_DARK_GRAY;
+    // Percentage below tank — BRIGHT RED for the tank causing the alert!
+    bool isAlerting = nodes[i].paired && !offline && (dist != -1) && (percent <= alertThreshold);
+    tft.fillRect(x, y + tankH + 2, tankW, 16, COLOR_BG);
+    tft.setTextSize(2); // Bold size 2 font for clear visibility
+    uint16_t col;
+    if (!nodes[i].paired || offline || dist == -1) {
+      col = COLOR_DARK_GRAY;
+    } else if (isAlerting) {
+      col = COLOR_RED; // BRIGHT RED for tank causing alert!
+    } else if (percent < 50) {
+      col = COLOR_ORANGE;
+    } else {
+      col = COLOR_ACCENT; // Green
+    }
     tft.setTextColor(col, COLOR_BG);
-    tft.setCursor(x + tankW/2 - 12, y + tankH + 3);
-    char buf[8];
-    if (!nodes[i].paired) strcpy(buf, "  --  ");
-    else if (offline)     strcpy(buf, "OFFLN ");
-    else sprintf(buf, " %3d%% ", percent);
+    char buf[10];
+    if (!nodes[i].paired) strcpy(buf, "--");
+    else if (offline)     strcpy(buf, "OFF");
+    else if (dist == -1)  strcpy(buf, "--");
+    else sprintf(buf, "%d%%", percent);
+    int txtW = strlen(buf) * 12; // 12px per char in size 2
+    tft.setCursor(x + (tankW - txtW)/2, y + tankH + 2);
     tft.print(buf);
   }
 }
 
 void drawPage1(bool fullRedraw) {
   if (fullRedraw) {
-    tft.fillRect(0, 32, 320, 208, COLOR_BG);
+    tft.fillRect(0, 32, 320, 188, COLOR_BG);
     invalidateCache = true;
   }
   updatePage1();
@@ -1954,7 +2072,16 @@ void drawStatusBar(bool fullRedraw) {
 }
 
 void drawDisplay(bool fullRedraw) {
-  if (fullRedraw) drawHeader();
+  // If active page changed, enforce a complete canvas wipe and clean re-render
+  if (currentPage != lastRenderedPage) {
+    fullRedraw = true;
+    lastRenderedPage = currentPage;
+  }
+  if (fullRedraw) {
+    drawHeader();
+    tft.fillRect(0, 32, 320, 188, COLOR_BG);
+    invalidateCache = true;
+  }
   if (currentPage == 0) drawPage0(fullRedraw);
   else drawPage1(fullRedraw);
   drawStatusBar(fullRedraw);
@@ -1963,6 +2090,9 @@ void drawDisplay(bool fullRedraw) {
 void setup() {
   Serial.begin(115200);
   startTime = millis();
+
+  // Load tank calibration immediately from NVS at startup
+  hubLoadCalibration();
 
   for (int i=0; i<MAX_NODES; i++) {
     nodes[i].paired = false;
@@ -1985,7 +2115,7 @@ void setup() {
   
   tft.fillScreen(COLOR_BG);
 
-  // Short startup beep to confirm buzzer works
+  // Startup chirp (100ms) to confirm buzzer works without delaying boot
   digitalWrite(TRANSISTOR_PIN, HIGH);
   delay(100);
   digitalWrite(TRANSISTOR_PIN, LOW);
@@ -2060,6 +2190,21 @@ void setup() {
     delay(800);
     server.on("/", []() { server.send(200, "text/html", getDashboardHTML()); });
     server.on("/pairing", []() { server.send(200, "text/html", getPairingHTML()); });
+    server.on("/testbuzzer", []() {
+      triggerBuzzerTest();
+      server.send(200, "text/plain", "Buzzer Test Executed!");
+    });
+    server.on("/dismissbuzzer", []() {
+      buzzerDismissed = !buzzerDismissed;
+      if (buzzerDismissed) {
+        digitalWrite(TRANSISTOR_PIN, LOW);
+        buzzerOn = false;
+      } else {
+        buzzerLast = 0;
+      }
+      if (!inMenu) drawHeader();
+      server.send(200, "text/plain", buzzerDismissed ? "Buzzer Dismissed" : "Buzzer Unmuted");
+    });
     server.on("/savecalib", []() {
       if (server.hasArg("empty"))  tankEmptyMm    = constrain(server.arg("empty").toInt(), 100, 5000);
       if (server.hasArg("full"))   tankFullMm     = constrain(server.arg("full").toInt(), 10, tankEmptyMm - 10);
@@ -2132,6 +2277,47 @@ void loop() {
   handleTouch();
   updateBuzzer(); // non-blocking buzzer driver
 
+  // Serial commands for testing
+  if (Serial.available()) {
+    String cmd = Serial.readStringUntil('\n');
+    cmd.trim();
+    if (cmd.equalsIgnoreCase("b") || cmd.equalsIgnoreCase("beep") || cmd.equalsIgnoreCase("test buzzer") || cmd.equalsIgnoreCase("buzzer") || cmd.equalsIgnoreCase("test")) {
+      triggerBuzzerTest();
+    } else if (cmd.equalsIgnoreCase("d") || cmd.equalsIgnoreCase("dismiss") || cmd.equalsIgnoreCase("mute")) {
+      buzzerDismissed = !buzzerDismissed;
+      if (buzzerDismissed) {
+        digitalWrite(TRANSISTOR_PIN, LOW);
+        buzzerOn = false;
+      } else {
+        buzzerLast = 0;
+      }
+      Serial.printf("[HUB] Buzzer %s\n", buzzerDismissed ? "DISMISSED / MUTED" : "UNMUTED / ACTIVE");
+      if (!inMenu) drawHeader();
+    } else if (cmd.equalsIgnoreCase("save") || cmd.equalsIgnoreCase("savecalib")) {
+      hubSaveCalibration();
+      Serial.println("[HUB] Tank config successfully saved into NVS!");
+    } else if (cmd.equalsIgnoreCase("calib") || cmd.equalsIgnoreCase("config") || cmd.equalsIgnoreCase("tank")) {
+      Serial.printf("[HUB] Tank Config in NVS: Empty=%d mm, Full=%d mm, Offset=%d mm, Alert=%d%%\n",
+                    tankEmptyMm, tankFullMm, sensorOffsetMm, alertThreshold);
+    } else if (cmd.startsWith("set empty ")) {
+      tankEmptyMm = constrain(cmd.substring(10).toInt(), 100, 5000);
+      hubSaveCalibration();
+      invalidateCache = true; forceRedraw = true;
+    } else if (cmd.startsWith("set full ")) {
+      tankFullMm = constrain(cmd.substring(9).toInt(), 10, tankEmptyMm - 10);
+      hubSaveCalibration();
+      invalidateCache = true; forceRedraw = true;
+    } else if (cmd.startsWith("set alert ")) {
+      alertThreshold = constrain(cmd.substring(10).toInt(), 5, 80);
+      hubSaveCalibration();
+      invalidateCache = true; forceRedraw = true;
+    } else if (cmd.startsWith("set offset ")) {
+      sensorOffsetMm = constrain(cmd.substring(11).toInt(), -500, 500);
+      hubSaveCalibration();
+      invalidateCache = true; forceRedraw = true;
+    }
+  }
+
   // Startup beacons (10s window after boot) so pre-existing nodes can re-sync
   if (startupBeaconActive) {
     if (millis() - startupBeaconStart < 10000) {
@@ -2163,10 +2349,10 @@ void loop() {
     return;
   }
 
-  // Full page redraw only when data changed (ESP-NOW triggered forceRedraw)
-  if (forceRedraw) {
+  // Redraw display when data changed or page switched
+  if (forceRedraw || currentPage != lastRenderedPage) {
     checkAlerts();        // Evaluate if any node is below alertThreshold
-    drawDisplay(false);   // false = don't nuke whole screen, just update dirty cells
+    drawDisplay(false);   // will automatically do fullRedraw if currentPage != lastRenderedPage
     forceRedraw = false;
   }
 
