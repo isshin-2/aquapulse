@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <ArduinoOTA.h>
+#include <Update.h>
 
 #define PAIRING_CHANNEL 1
 
@@ -1697,6 +1698,48 @@ void broadcastBeacon() {
   esp_now_send(broadcast, (uint8_t *)&b, sizeof(PairingBeacon));
 }
 
+
+// ─── OTA WIRELESS UPDATE HELPERS ─────────────────────────────────────────────
+void drawOTAProgress(int percent) {
+  static int lastPct = -1;
+  if (percent == lastPct) return;
+  lastPct = percent;
+  
+  int barX = 20, barY = 120, barW = 280, barH = 24;
+  tft.drawRoundRect(barX, barY, barW, barH, 4, COLOR_WHITE);
+  int fillW = map(percent, 0, 100, 0, barW - 4);
+  fillW = constrain(fillW, 0, barW - 4);
+  tft.fillRect(barX + 2, barY + 2, fillW, barH - 4, COLOR_ACCENT);
+  tft.fillRect(barX + 2 + fillW, barY + 2, (barW - 4) - fillW, barH - 4, COLOR_DARK_GRAY);
+
+  tft.fillRect(130, 160, 60, 20, COLOR_BG);
+  tft.setTextSize(2);
+  tft.setTextColor(COLOR_CYAN, COLOR_BG);
+  tft.setCursor(130, 160);
+  tft.printf("%d%%", percent);
+}
+
+String getOTAHTML() {
+  String h = "<!DOCTYPE html><html lang='en'><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>AQUAPULSE Hub OTA Update</title><style>";
+  h += "body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f172a; color: #fff; text-align: center; padding: 25px; margin: 0; }";
+  h += ".card { max-width: 480px; margin: 20px auto; background: #1e293b; padding: 30px; border-radius: 12px; border: 1px solid #334155; text-align: left; }";
+  h += "h1 { color: #38bdf8; font-size: 22px; margin-bottom: 5px; }";
+  h += ".sub { color: #94a3b8; font-size: 13px; margin-bottom: 20px; }";
+  h += ".drop { border: 2px dashed #475569; padding: 20px; border-radius: 8px; text-align: center; background: #0f172a; margin-bottom: 20px; }";
+  h += "input[type='file'] { width: 100%; color: #94a3b8; font-size: 14px; margin-top: 10px; }";
+  h += ".btn { width: 100%; padding: 14px; background: #0284c7; color: #fff; border: none; border-radius: 8px; font-size: 16px; font-weight: bold; cursor: pointer; }";
+  h += ".prog { display: none; margin-top: 20px; }";
+  h += ".bar { width: 100%; height: 18px; background: #334155; border-radius: 9px; overflow: hidden; }";
+  h += ".fill { width: 0%; height: 100%; background: #22c55e; transition: width 0.2s; }";
+  h += ".back { display: block; text-align: center; margin-top: 20px; color: #38bdf8; text-decoration: none; font-size: 14px; }";
+  h += "</style></head><body><div class='card'><h1>⚡ AQUAPULSE Hub OTA</h1><div class='sub'>Wireless Firmware Update (No USB Cable Needed)</div>";
+  h += "<form id='f' method='POST' action='/update' enctype='multipart/form-data'><div class='drop'><div style='font-size:32px;'>📦</div><b>Select firmware.bin</b><br><input type='file' id='up' name='update' accept='.bin' required></div>";
+  h += "<button type='submit' class='btn' id='b'>Flash Firmware Wirelessly</button><div class='prog' id='pb'><p id='pt' style='color:#38bdf8;'>Uploading: 0%</p><div class='bar'><div class='fill' id='pf'></div></div></div></form>";
+  h += "document.getElementById('f').onsubmit = function(e){e.preventDefault(); const file=document.getElementById('up').files[0]; if(!file)return; document.getElementById('b').disabled=true; document.getElementById('b').innerText='Flashing in progress...'; document.getElementById('pb').style.display='block'; const xhr=new XMLHttpRequest(); xhr.open('POST','/update',true); xhr.upload.onprogress=function(e){if(e.lengthComputable){const p=Math.round((e.loaded/e.total)*100); document.getElementById('pt').innerText='Uploading: '+p+'% (Do not power off)'; document.getElementById('pf').style.width=p+'%';}}; xhr.onload=function(){if(xhr.status===200){document.body.innerHTML='<div style=\\'max-width:440px;margin:80px auto;background:#1e293b;padding:30px;border-radius:12px;text-align:center;\\'><h2>Update Successful!</h2><p>Hub is restarting... returning to dashboard in 10s.</p></div>'; setTimeout(()=>{window.location.href='/';},10000);}else{alert('Update failed: '+xhr.responseText); document.getElementById('b').disabled=false; document.getElementById('b').innerText='Retry Flash';}}; const fd=new FormData(); fd.append('update',file); xhr.send(fd);};";
+  h += "</script></body></html>";
+  return h;
+}
+
 String getDashboardHTML() {
   String html = "<!DOCTYPE html><html lang='en'><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width, initial-scale=1'><title>AQUAPULSE Dashboard</title><style>";
   html += "body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; text-align: center; background: #0f172a; color: #fff; margin:0; padding:20px; }";
@@ -1734,6 +1777,7 @@ String getDashboardHTML() {
   html += "<label>Sensor Distance Offset (mm):</label><input type='number' name='offset' value='" + String(sensorOffsetMm) + "'>";
   html += "<label>Alert Threshold (%):</label><input type='number' name='alert' value='" + String(alertThreshold) + "'>";
   html += "<button type='submit'>Save Calibration</button></form></div>";
+  html += "<div class='card'><h3>⚡ Wireless Firmware Update (OTA)</h3><p style='color:#94a3b8;font-size:13px;'>Flash firmware wirelessly over Wi-Fi without a USB cable.</p><a href='/update' style='display:block;text-align:center;padding:12px;background:#0284c7;color:#fff;border-radius:6px;font-weight:bold;text-decoration:none;'>Open Wireless OTA Flasher &rarr;</a></div>";
   html += "<div class='card'><h3>Hardware Diagnostics & Alarm</h3>";
   html += "<button type='button' style='background:#f59e0b;padding:10px 16px;border:none;border-radius:5px;color:white;font-weight:bold;cursor:pointer;' onclick=\"fetch('/testbuzzer').then(()=>alert('Buzzer test triggered!'))\">🔊 Test Hub Buzzer</button>";
   if (buzzerAlert) {
@@ -2234,6 +2278,58 @@ void setup() {
     tft.println("\nConnected!");
     delay(800);
     server.on("/", []() { server.send(200, "text/html", getDashboardHTML()); });
+    server.on("/update", HTTP_GET, []() {
+      server.send(200, "text/html", getOTAHTML());
+    });
+    server.on("/update", HTTP_POST, []() {
+      server.sendHeader("Connection", "close");
+      server.send(200, "text/plain", Update.hasError() ? "FAIL" : "OK");
+      delay(1000);
+      ESP.restart();
+    }, []() {
+      HTTPUpload& upload = server.upload();
+      if (upload.status == UPLOAD_FILE_START) {
+        Serial.printf("[WEB-OTA] Update start: %s\n", upload.filename.c_str());
+        tft.fillScreen(COLOR_BG);
+        tft.setTextColor(COLOR_HEADER);
+        tft.setTextSize(2);
+        tft.setCursor(20, 40);
+        tft.print("OTA WIRELESS UPDATE");
+        tft.setTextSize(1);
+        tft.setTextColor(COLOR_WHITE);
+        tft.setCursor(20, 75);
+        tft.print("Receiving firmware over Wi-Fi...");
+        tft.setCursor(20, 95);
+        tft.print("DO NOT POWER OFF THE HUB!");
+        if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+          Update.printError(Serial);
+        }
+      } else if (upload.status == UPLOAD_FILE_WRITE) {
+        if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+          Update.printError(Serial);
+        } else {
+          int pct = (upload.totalSize > 0) ? (int)((upload.totalSize * 100) / 950000) : 0;
+          pct = constrain(pct, 0, 99);
+          drawOTAProgress(pct);
+        }
+      } else if (upload.status == UPLOAD_FILE_END) {
+        if (Update.end(true)) {
+          Serial.printf("[WEB-OTA] Success: %u bytes\n", upload.totalSize);
+          drawOTAProgress(100);
+          tft.fillScreen(COLOR_BG);
+          tft.setTextColor(COLOR_ACCENT);
+          tft.setTextSize(2);
+          tft.setCursor(20, 80);
+          tft.print("UPDATE SUCCESSFUL!");
+          tft.setTextSize(1);
+          tft.setTextColor(COLOR_WHITE);
+          tft.setCursor(20, 120);
+          tft.print("Rebooting Hub into new firmware...");
+        } else {
+          Update.printError(Serial);
+        }
+      }
+    });
     server.on("/pairing", []() { server.send(200, "text/html", getPairingHTML()); });
     server.on("/testbuzzer", []() {
       triggerBuzzerTest();
@@ -2263,6 +2359,38 @@ void setup() {
       ESP.restart();
     });
     server.begin();
+    ArduinoOTA.setHostname("aquapulse-hub");
+    ArduinoOTA.onStart([]() {
+      Serial.println("[ArduinoOTA] Start");
+      tft.fillScreen(COLOR_BG);
+      tft.setTextColor(COLOR_HEADER);
+      tft.setTextSize(2);
+      tft.setCursor(20, 40);
+      tft.print("ARDUINO-OTA UPDATE");
+      tft.setTextSize(1);
+      tft.setTextColor(COLOR_WHITE);
+      tft.setCursor(20, 75);
+      tft.print("DO NOT POWER OFF THE HUB!");
+    });
+    ArduinoOTA.onEnd([]() {
+      Serial.println("\n[ArduinoOTA] End");
+      tft.fillScreen(COLOR_BG);
+      tft.setTextColor(COLOR_ACCENT);
+      tft.setTextSize(2);
+      tft.setCursor(20, 80);
+      tft.print("OTA COMPLETE!");
+      tft.setTextSize(1);
+      tft.setTextColor(COLOR_WHITE);
+      tft.setCursor(20, 120);
+      tft.print("Rebooting Hub...");
+    });
+    ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+      int pct = (progress * 100) / total;
+      drawOTAProgress(pct);
+    });
+    ArduinoOTA.onError([](ota_error_t error) {
+      Serial.printf("[ArduinoOTA] Error[%u]\n", error);
+    });
     ArduinoOTA.begin();
   } else {
     // No WiFi configured – start normally without blocking.
