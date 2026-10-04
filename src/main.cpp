@@ -564,6 +564,8 @@ void drawMenu();
 void drawSlider();
 void drawQRCode(const char *text, const char *title);
 void startWifiAP();
+void connectToSavedWifi();
+void initWebServer();
 void broadcastBeacon();
 
 #include <esp_now.h>
@@ -624,6 +626,7 @@ const int BL_PIN = 22;
 bool inMenu = false;
 int qrMode = 0;
 WebServer server(80);
+bool serverInitialized = false;
 
 bool isPairingMode = false;
 unsigned long pairingStartTime = 0;
@@ -970,18 +973,32 @@ void drawHeader() {
 }
 
 void startWifiAP() {
+  if (serverInitialized) {
+    server.stop();
+    serverInitialized = false;
+  }
   WiFi.mode(WIFI_AP_STA);
-  uint8_t mac[6];
-  WiFi.macAddress(mac);
   char apSSID[32];
-  sprintf(apSSID, "HUB_%02X%02X", mac[4], mac[5]);
+  sprintf(apSSID, "HUB_%02X%02X", myMAC[4], myMAC[5]);
   WiFi.softAP(apSSID, "12345678");
   delay(200);
+
+  // Scan for nearby 2.4GHz WiFi networks
+  int n = WiFi.scanNetworks();
+  String netOptions = "<option value=''>-- Select Detected WiFi Network --</option>";
+  for (int i = 0; i < n && i < 20; i++) {
+    String s = WiFi.SSID(i);
+    if (s.length() > 0) {
+      int rssi = WiFi.RSSI(i);
+      int quality = constrain(2 * (rssi + 100), 0, 100);
+      netOptions += "<option value='" + s + "'>" + s + " (" + String(quality) + "% signal)</option>";
+    }
+  }
 
   char qrStr[64];
   sprintf(qrStr, "WIFI:T:WPA;S:%s;P:12345678;;", apSSID);
   inMenu = false;
-  drawQRCode(qrStr, "Scan, then visit:");
+  drawQRCode(qrStr, "Scan with Phone:");
 
   tft.setTextColor(TFT_WHITE);
   tft.setTextSize(1);
@@ -995,15 +1012,23 @@ void startWifiAP() {
 
   bool saved = false;
   apServer.on("/", [&]() {
-    String pg = "<!DOCTYPE html><html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>WiFi Setup</title><style>body{background:#0f172a;color:#fff;font-family:sans-serif;padding:20px}input{width:100%;padding:10px;margin:10px 0;box-sizing:border-box;border-radius:5px;border:none}button{width:100%;padding:15px;background:#38bdf8;color:#fff;border:none;border-radius:5px;font-weight:bold}</style></head><body>";
-    pg += "<h2>AQUAPULSE WiFi Setup</h2><p>Enter your home network credentials.</p>";
-    pg += "<form action='/save' method='GET'><input name='s' placeholder='Network Name (SSID)' required><input name='p' placeholder='Password' type='password'><button type='submit'>Connect Hub</button></form></body></html>";
+    String pg = "<!DOCTYPE html><html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>WiFi Setup</title><style>body{background:#0f172a;color:#fff;font-family:sans-serif;padding:20px}select,input{width:100%;padding:12px;margin:8px 0;box-sizing:border-box;border-radius:6px;border:1px solid #334155;background:#1e293b;color:#fff;font-size:16px;}button{width:100%;padding:14px;background:#38bdf8;color:#0f172a;border:none;border-radius:6px;font-weight:bold;font-size:16px;cursor:pointer;margin-top:12px;}</style></head><body>";
+    pg += "<h2>AQUAPULSE WiFi Setup</h2><p style='color:#94a3b8'>Connect Hub to your home WiFi for remote dashboard access.</p>";
+    pg += "<form action='/save' method='GET'>";
+    pg += "<label style='color:#94a3b8;font-size:13px;'>SELECT DETECTED NETWORK:</label>";
+    pg += "<select onchange='if(this.value)document.getElementById(\"sInp\").value=this.value'>" + netOptions + "</select>";
+    pg += "<label style='color:#94a3b8;font-size:13px;'>NETWORK NAME (SSID):</label>";
+    pg += "<input id='sInp' name='s' value='" + hubSSID + "' placeholder='Network Name (SSID)' required>";
+    pg += "<label style='color:#94a3b8;font-size:13px;'>PASSWORD:</label>";
+    pg += "<input name='p' placeholder='WiFi Password' type='password'>";
+    pg += "<button type='submit'>Connect Hub to WiFi</button>";
+    pg += "</form></body></html>";
     apServer.send(200, "text/html; charset=utf-8", pg);
   });
   apServer.on("/save", [&]() {
     String s = apServer.arg("s");
     String p = apServer.arg("p");
-    apServer.send(200, "text/html", "<html><body style='background:#0f172a;color:#fff;padding:20px'><h2>Saved! Hub rebooting...</h2></body></html>");
+    apServer.send(200, "text/html", "<html><body style='background:#0f172a;color:#fff;padding:20px;font-family:sans-serif;'><h2>Credentials Saved!</h2><p>Hub is rebooting and connecting to " + s + "...</p></body></html>");
     delay(600);
     Preferences pr;
     pr.begin("hub", false);
@@ -1027,11 +1052,82 @@ void startWifiAP() {
     yield();
   }
   apDns.stop();
+  apServer.stop();
   WiFi.softAPdisconnect(true);
   WiFi.mode(WIFI_STA);
   esp_wifi_set_channel(PAIRING_CHANNEL, WIFI_SECOND_CHAN_NONE);
   inMenu = true;
   currentMenuPage = 4;
+  drawMenu();
+}
+
+void connectToSavedWifi() {
+  if (hubSSID.length() == 0) {
+    startWifiAP();
+    return;
+  }
+  
+  // Show pop-up on TFT screen
+  tft.fillRect(20, 60, 280, 120, COLOR_DARK_GRAY);
+  tft.drawRect(20, 60, 280, 120, COLOR_CYAN);
+  tft.setTextColor(COLOR_WHITE);
+  tft.setTextSize(2);
+  tft.setCursor(35, 75);
+  tft.print("Connecting to WiFi:");
+  tft.setTextColor(COLOR_ACCENT);
+  tft.setTextSize(1);
+  tft.setCursor(35, 102);
+  tft.print(hubSSID);
+  tft.setTextColor(COLOR_CYAN);
+  tft.setCursor(35, 122);
+  tft.print("Please wait...");
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(hubSSID.c_str(), hubPASS.c_str());
+
+  unsigned long start = millis();
+  int dotCount = 0;
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 9000) {
+    delay(300);
+    tft.print(".");
+    dotCount++;
+    if (dotCount % 8 == 0) {
+      tft.fillRect(35, 138, 250, 15, COLOR_DARK_GRAY);
+      tft.setCursor(35, 138);
+    }
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    tft.fillRect(20, 60, 280, 120, COLOR_DARK_GRAY);
+    tft.drawRect(20, 60, 280, 120, 0x07E0); // Bright green
+    tft.setTextColor(0x07E0);
+    tft.setTextSize(2);
+    tft.setCursor(35, 75);
+    tft.print("CONNECTED!");
+    tft.setTextColor(COLOR_WHITE);
+    tft.setTextSize(1);
+    tft.setCursor(35, 102);
+    tft.print("IP: "); tft.print(WiFi.localIP());
+    tft.setCursor(35, 122);
+    tft.print("Web Dashboard Ready!");
+    
+    initWebServer();
+    delay(1800);
+  } else {
+    tft.fillRect(20, 60, 280, 120, COLOR_DARK_GRAY);
+    tft.drawRect(20, 60, 280, 120, COLOR_RED);
+    tft.setTextColor(COLOR_RED);
+    tft.setTextSize(2);
+    tft.setCursor(35, 75);
+    tft.print("CONNECTION FAILED");
+    tft.setTextColor(COLOR_WHITE);
+    tft.setTextSize(1);
+    tft.setCursor(35, 102);
+    tft.print("Check password or router.");
+    tft.setCursor(35, 122);
+    tft.print("Tap screen to return...");
+    delay(1800);
+  }
   drawMenu();
 }
 
@@ -1156,17 +1252,29 @@ void drawMenu() {
     drawSlider(); // draws at y=50
 
     // Row of 3 square buttons (y=80..140)
-    // [DASHBOARD]  [NODE CFG]  [TANK CAL]
-    // Each ~96px wide, 8px gap
+    // [WiFi Setup]  [NODE CFG]  [TANK CAL]
     int bY = 82, bH = 56;
-    tft.fillRoundRect(4,   bY, 97, bH, 5, COLOR_DARK_GRAY);
+    bool isConnected = (WiFi.status() == WL_CONNECTED);
+    tft.fillRoundRect(4,   bY, 97, bH, 5, isConnected ? 0x0280 : COLOR_DARK_GRAY);
     tft.fillRoundRect(111, bY, 97, bH, 5, COLOR_DARK_GRAY);
     tft.fillRoundRect(218, bY, 97, bH, 5, COLOR_DARK_GRAY);
 
     tft.setTextSize(1);
-    tft.setTextColor(COLOR_CYAN);
-    tft.setCursor(16,  bY + 14); tft.print("WiFi");
-    tft.setCursor(16,  bY + 28); tft.print("Setup");
+    tft.setTextColor(isConnected ? COLOR_WHITE : COLOR_CYAN);
+    tft.setCursor(16,  bY + 12); tft.print("WiFi");
+    tft.setCursor(16,  bY + 24);
+    if (isConnected) {
+      tft.print("ONLINE");
+    } else if (hubSSID.length() > 0) {
+      tft.print("Saved");
+    } else {
+      tft.print("Setup");
+    }
+    tft.setCursor(16,  bY + 38);
+    tft.setTextColor(isConnected ? 0x07E0 : COLOR_WHITE);
+    tft.print("CONFIG");
+
+    tft.setTextColor(COLOR_WHITE);
     tft.setCursor(122, bY + 14); tft.print("NODE");
     tft.setCursor(122, bY + 28); tft.print("CONFIG");
     tft.setTextColor(COLOR_ACCENT);
@@ -1365,48 +1473,102 @@ void drawMenu() {
     tft.print("BACK");
   }
   else if (currentMenuPage == 4) {
-    // WiFi Setup info page
+    // WiFi Setup & Connection info page
     tft.fillRect(0, 0, 320, 24, COLOR_DARK_GRAY);
     tft.setTextColor(COLOR_HEADER);
     tft.setTextSize(2);
     tft.setCursor(6, 4);
-    tft.print("WIFI SETUP");
+    tft.print("WIFI SETUP & CONNECT");
+
+    bool isConn = (WiFi.status() == WL_CONNECTED);
+
+    // Status Banner Box (y=28..90)
+    uint16_t boxBorder = isConn ? 0x07E0 : (hubSSID.length() > 0 ? COLOR_ORANGE : COLOR_DARK_GRAY);
+    tft.fillRoundRect(8, 28, 304, 62, 5, isConn ? 0x0208 : 0x18C3);
+    tft.drawRoundRect(8, 28, 304, 62, 5, boxBorder);
 
     tft.setTextSize(1);
-    tft.setTextColor(COLOR_WHITE);
-    tft.setCursor(10, 32);
-    tft.print("Connect Hub to home WiFi for OTA.");
-
-    // Start Setup button
-    tft.fillRoundRect(8, 54, 304, 50, 6, COLOR_CYAN);
-    tft.setTextColor(COLOR_BG);
-    tft.setTextSize(2);
-    tft.setCursor(50, 70);
-    tft.print("Start WiFi Setup AP");
-
-    // Current saved WiFi
-    tft.setTextSize(1);
-    tft.setTextColor(COLOR_WHITE);
-    tft.setCursor(10, 116);
-    if (hubSSID.length() > 0) {
-      tft.print("Saved: "); tft.print(hubSSID);
+    if (isConn) {
+      tft.setTextColor(0x07E0);
+      tft.setCursor(16, 34);
+      tft.print("STATUS: ONLINE (CONNECTED)");
+      tft.setTextColor(COLOR_WHITE);
+      tft.setCursor(16, 48);
+      tft.print("SSID: "); tft.print(hubSSID);
+      tft.setTextColor(COLOR_CYAN);
+      tft.setCursor(16, 62);
+      tft.print("IP:   "); tft.print(WiFi.localIP().toString());
+      tft.setCursor(16, 74);
+      tft.setTextColor(0xFFE0); // Yellow
+      tft.print("Web:  http://"); tft.print(WiFi.localIP().toString()); tft.print("/");
     } else {
-      tft.print("No WiFi saved.");
+      tft.setTextColor(COLOR_ORANGE);
+      tft.setCursor(16, 34);
+      tft.print("STATUS: DISCONNECTED");
+      tft.setTextColor(COLOR_WHITE);
+      tft.setCursor(16, 48);
+      if (hubSSID.length() > 0) {
+        tft.print("Saved SSID: "); tft.print(hubSSID);
+        tft.setTextColor(COLOR_CYAN);
+        tft.setCursor(16, 64);
+        tft.print("Tap CONNECT below to join WiFi.");
+      } else {
+        tft.print("No WiFi network configured.");
+        tft.setTextColor(COLOR_CYAN);
+        tft.setCursor(16, 64);
+        tft.print("Tap SETUP AP to configure via phone.");
+      }
     }
 
-    // Forget WiFi button
-    tft.fillRoundRect(8, 132, 304, 36, 6, 0xA000);
-    tft.setTextColor(COLOR_WHITE);
-    tft.setTextSize(1);
-    tft.setCursor(70, 145);
-    tft.print("Forget saved WiFi & restart");
+    if (hubSSID.length() > 0) {
+      // Button 1 (y=96..132, h=36): Connect or Reconnect
+      uint16_t btnCol = isConn ? COLOR_BLUE : 0x03E0;
+      tft.fillRoundRect(8, 96, 304, 36, 5, btnCol);
+      tft.setTextColor(COLOR_WHITE);
+      tft.setTextSize(2);
+      tft.setCursor(isConn ? 32 : 36, 106);
+      tft.print(isConn ? "RE-CHECK / RECONNECT" : "CONNECT TO SAVED WIFI");
 
-    // BACK
-    tft.fillRoundRect(8, 182, 304, 38, 6, COLOR_DARK_GRAY);
-    tft.setTextColor(COLOR_WHITE);
-    tft.setTextSize(2);
-    tft.setCursor(134, 192);
-    tft.print("BACK");
+      // Button 2 (y=138..174, h=36): Start Setup AP (New WiFi)
+      tft.fillRoundRect(8, 138, 304, 36, 5, COLOR_CYAN);
+      tft.setTextColor(COLOR_BG);
+      tft.setTextSize(2);
+      tft.setCursor(34, 148);
+      tft.print("SETUP NEW WIFI (AP)");
+
+      // Button 3 & 4 (y=182..218, h=36)
+      // Left: Forget WiFi
+      tft.fillRoundRect(8, 182, 146, 36, 5, COLOR_RED);
+      tft.setTextColor(COLOR_WHITE);
+      tft.setTextSize(1);
+      tft.setCursor(32, 195);
+      tft.print("FORGET WIFI");
+
+      // Right: Back
+      tft.fillRoundRect(166, 182, 146, 36, 5, COLOR_DARK_GRAY);
+      tft.setTextColor(COLOR_WHITE);
+      tft.setTextSize(2);
+      tft.setCursor(212, 192);
+      tft.print("BACK");
+    } else {
+      // No saved WiFi
+      // Button 1 (y=100..152, h=52): Start Setup AP
+      tft.fillRoundRect(8, 100, 304, 52, 6, COLOR_CYAN);
+      tft.setTextColor(COLOR_BG);
+      tft.setTextSize(2);
+      tft.setCursor(38, 114);
+      tft.print("START WIFI SETUP AP");
+      tft.setTextSize(1);
+      tft.setCursor(55, 136);
+      tft.print("Scan QR code with your phone");
+
+      // Button 2 (y=164..210, h=46): Back
+      tft.fillRoundRect(8, 164, 304, 46, 6, COLOR_DARK_GRAY);
+      tft.setTextColor(COLOR_WHITE);
+      tft.setTextSize(2);
+      tft.setCursor(134, 178);
+      tft.print("BACK");
+    }
   }
 }
 
@@ -1484,10 +1646,10 @@ void handleTouch() {
           }
         } else {
           if (currentMenuPage == 0) {
-            // DASHBOARD — left third button row (x=4..101, y=82..138)
+            // WiFi Setup & Connection — left third button row (x=4..101, y=82..138)
             if (startX > 4 && startX < 101 && startY > 82 && startY < 138) {
-              qrMode = 1;
-              drawQRCode("http://192.168.4.1/", "DASHBOARD QR");
+              currentMenuPage = 4;
+              drawMenu();
             }
             // NODE CONFIG — middle button (x=111..208)
             else if (startX > 111 && startX < 208 && startY > 82 && startY < 138) {
@@ -1628,26 +1790,46 @@ void handleTouch() {
             }
           }
           else if (currentMenuPage == 4) {
-            // Start WiFi Setup AP button (y=54..104)
-            if (startY > 54 && startY < 104) {
-              startWifiAP();
-            }
-            // Forget WiFi button (y=132..168)
-            else if (startY > 132 && startY < 168) {
-              Preferences pr;
-              pr.begin("hub", false);
-              pr.remove("ssid");
-              pr.remove("pass");
-              pr.end();
-              hubSSID = "";
-              hubPASS = "";
-              delay(300);
-              ESP.restart();
-            }
-            // BACK (y=182..220)
-            else if (startY > 182 && startY < 220) {
-              currentMenuPage = 0;
-              drawMenu();
+            if (hubSSID.length() > 0) {
+              // Button 1: Connect or Reconnect (y=96..134)
+              if (startY >= 96 && startY <= 134) {
+                connectToSavedWifi();
+              }
+              // Button 2: Start Setup AP (y=138..176)
+              else if (startY >= 138 && startY <= 176) {
+                startWifiAP();
+              }
+              // Button 3 & 4 (y=182..222)
+              else if (startY >= 182 && startY <= 222) {
+                if (startX <= 158) {
+                  // Forget WiFi
+                  Preferences pr;
+                  pr.begin("hub", false);
+                  pr.remove("ssid");
+                  pr.remove("pass");
+                  pr.end();
+                  hubSSID = "";
+                  hubPASS = "";
+                  WiFi.disconnect(true);
+                  delay(300);
+                  drawMenu();
+                } else {
+                  // Back
+                  currentMenuPage = 0;
+                  drawMenu();
+                }
+              }
+            } else {
+              // No saved WiFi
+              // Button 1: Start Setup AP (y=100..154)
+              if (startY >= 100 && startY <= 154) {
+                startWifiAP();
+              }
+              // Button 2: Back (y=164..212)
+              else if (startY >= 164 && startY <= 212) {
+                currentMenuPage = 0;
+                drawMenu();
+              }
             }
           }
           else if (currentMenuPage == 99) {
@@ -1791,6 +1973,43 @@ void drawQRCode(const char *text, const char *title) {
 
 
 
+
+void initWebServer() {
+  if (serverInitialized) return;
+
+  server.on("/", []() { server.send(200, "text/html", getDashboardHTML()); });
+  server.on("/pairing", []() { server.send(200, "text/html", getPairingHTML()); });
+  server.on("/testbuzzer", []() {
+    triggerBuzzerTest();
+    server.send(200, "text/plain", "Buzzer Test Executed!");
+  });
+  server.on("/dismissbuzzer", []() {
+    toggleSnooze();
+    server.send(200, "text/plain", snoozeActive ? "Buzzer Snoozed for 30m" : "Snooze Cancelled / Unmuted");
+  });
+  server.on("/savecalib", []() {
+    if (server.hasArg("empty"))  tankEmptyMm    = constrain(server.arg("empty").toInt(), 100, 5000);
+    if (server.hasArg("full"))   tankFullMm     = constrain(server.arg("full").toInt(), 10, tankEmptyMm - 10);
+    if (server.hasArg("offset")) sensorOffsetMm = constrain(server.arg("offset").toInt(), -500, 500);
+    if (server.hasArg("alert"))  alertThreshold = constrain(server.arg("alert").toInt(), 5, 80);
+    hubSaveCalibration();
+    invalidateCache = true;
+    forceRedraw = true;
+    server.send(200, "text/html", "<!DOCTYPE html><html><head><meta http-equiv='refresh' content='2;url=/'><style>body{background:#0f172a;color:#fff;font-family:sans-serif;text-align:center;padding:50px}</style></head><body><h2>Calibration Saved!</h2><p>Redirecting to dashboard...</p></body></html>");
+  });
+  server.on("/savewifi", []() {
+    hubPrefs.begin("hub", false);
+    hubPrefs.putString("ssid", server.arg("s"));
+    hubPrefs.putString("pass", server.arg("p"));
+    hubPrefs.end();
+    server.send(200, "text/html", "<html><body style='background:#0f172a;color:#fff;font-family:sans-serif;padding:20px'><h2>Saved! Rebooting...</h2></body></html>");
+    delay(1000);
+    ESP.restart();
+  });
+  server.begin();
+  serverInitialized = true;
+  Serial.printf("[HUB] WebServer online! IP: %s\n", WiFi.localIP().toString().c_str());
+}
 
 uint16_t getDistColor(int percent) {
   if (percent <= alertThreshold) return COLOR_RED;
@@ -2105,6 +2324,20 @@ void drawStatusBar(bool fullRedraw) {
   char nc[4]; sprintf(nc, "%d ", pCount);
   tft.print(nc);
 
+  // WiFi indicator (x=202..260)
+  tft.setCursor(202, 226);
+  tft.setTextSize(1);
+  if (WiFi.status() == WL_CONNECTED) {
+    tft.setTextColor(0x07E0, COLOR_DARK_GRAY); // bright green
+    tft.print("WiFi:OK");
+  } else if (hubSSID.length() > 0) {
+    tft.setTextColor(COLOR_ORANGE, COLOR_DARK_GRAY);
+    tft.print("WiFi:--");
+  } else {
+    tft.setTextColor(COLOR_DARK_GRAY, COLOR_DARK_GRAY);
+    tft.print("       ");
+  }
+
   // Clock — textSize=1: each char=6px, "HH:MM:SS"=48px, x=268..316 (inside 320)
   unsigned long upSec = (millis() - startTime) / 1000;
   char buf[12];
@@ -2113,7 +2346,6 @@ void drawStatusBar(bool fullRedraw) {
   tft.setTextColor(COLOR_CYAN, COLOR_DARK_GRAY);
   tft.setCursor(268, 226);
   tft.print(buf);
-
 }
 
 void drawDisplay(bool fullRedraw) {
@@ -2232,45 +2464,17 @@ void setup() {
   if (connected) {
     isAPMode = false;
     tft.println("\nConnected!");
+    tft.print("IP: "); tft.println(WiFi.localIP());
     delay(800);
-    server.on("/", []() { server.send(200, "text/html", getDashboardHTML()); });
-    server.on("/pairing", []() { server.send(200, "text/html", getPairingHTML()); });
-    server.on("/testbuzzer", []() {
-      triggerBuzzerTest();
-      server.send(200, "text/plain", "Buzzer Test Executed!");
-    });
-    server.on("/dismissbuzzer", []() {
-      toggleSnooze();
-      server.send(200, "text/plain", snoozeActive ? "Buzzer Snoozed for 30m" : "Snooze Cancelled / Unmuted");
-    });
-    server.on("/savecalib", []() {
-      if (server.hasArg("empty"))  tankEmptyMm    = constrain(server.arg("empty").toInt(), 100, 5000);
-      if (server.hasArg("full"))   tankFullMm     = constrain(server.arg("full").toInt(), 10, tankEmptyMm - 10);
-      if (server.hasArg("offset")) sensorOffsetMm = constrain(server.arg("offset").toInt(), -500, 500);
-      if (server.hasArg("alert"))  alertThreshold = constrain(server.arg("alert").toInt(), 5, 80);
-      hubSaveCalibration();
-      invalidateCache = true;
-      forceRedraw = true;
-      server.send(200, "text/html", "<!DOCTYPE html><html><head><meta http-equiv='refresh' content='2;url=/'><style>body{background:#0f172a;color:#fff;font-family:sans-serif;text-align:center;padding:50px}</style></head><body><h2>Calibration Saved!</h2><p>Redirecting to dashboard...</p></body></html>");
-    });
-    server.on("/savewifi", []() {
-      hubPrefs.begin("hub", false);
-      hubPrefs.putString("ssid", server.arg("s"));
-      hubPrefs.putString("pass", server.arg("p"));
-      hubPrefs.end();
-      server.send(200, "text/html", "<html><body style='background:#0f172a;color:#fff;font-family:sans-serif;padding:20px'><h2>Saved! Rebooting...</h2></body></html>");
-      delay(1000);
-      ESP.restart();
-    });
-    server.begin();
-    ArduinoOTA.begin();
+    initWebServer();
   } else {
     // No WiFi configured – start normally without blocking.
-    // User can set up WiFi later from the menu (for OTA updates).
+    // User can set up or connect to WiFi anytime from the menu.
     isAPMode = false;
     WiFi.mode(WIFI_STA); // Needed for ESP-NOW on channel
     esp_wifi_set_channel(PAIRING_CHANNEL, WIFI_SECOND_CHAN_NONE);
     tft.println("\nNo WiFi - ESP-NOW only");
+    tft.println("(Connect anytime via Menu)");
     delay(600);
   }
 
@@ -2310,8 +2514,10 @@ void setup() {
 }
 
 void loop() {
-  ArduinoOTA.handle();
-  server.handleClient();
+  if (WiFi.status() == WL_CONNECTED && serverInitialized) {
+    ArduinoOTA.handle();
+    server.handleClient();
+  }
   handleTouch();
   updateBuzzer(); // non-blocking buzzer driver
 
@@ -2334,6 +2540,16 @@ void loop() {
       triggerBuzzerTest();
     } else if (cmd.equalsIgnoreCase("d") || cmd.equalsIgnoreCase("dismiss") || cmd.equalsIgnoreCase("mute") || cmd.equalsIgnoreCase("snooze") || cmd.equalsIgnoreCase("snz")) {
       toggleSnooze();
+    } else if (cmd.equalsIgnoreCase("wifi") || cmd.equalsIgnoreCase("wifistatus")) {
+      Serial.printf("[HUB] WiFi Status: %s, SSID: '%s', IP: %s, RSSI: %d dBm\n",
+                    (WiFi.status() == WL_CONNECTED) ? "CONNECTED" : "DISCONNECTED",
+                    hubSSID.c_str(), WiFi.localIP().toString().c_str(), WiFi.RSSI());
+    } else if (cmd.equalsIgnoreCase("wifi connect") || cmd.equalsIgnoreCase("wificonnect")) {
+      Serial.println("[HUB] Connecting to saved WiFi...");
+      connectToSavedWifi();
+    } else if (cmd.equalsIgnoreCase("wifi setup") || cmd.equalsIgnoreCase("wifisetup") || cmd.equalsIgnoreCase("ap")) {
+      Serial.println("[HUB] Starting WiFi setup AP...");
+      startWifiAP();
     } else if (cmd.equalsIgnoreCase("save") || cmd.equalsIgnoreCase("savecalib")) {
       hubSaveCalibration();
       Serial.println("[HUB] Tank config successfully saved into NVS!");
