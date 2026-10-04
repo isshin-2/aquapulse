@@ -627,6 +627,11 @@ bool inMenu = false;
 int qrMode = 0;
 WebServer server(80);
 bool serverInitialized = false;
+bool inAPSetup = false;
+String scannedNetworksHTML = "";
+bool newCredentialsSaved = false;
+void setupServerRoutes();
+String getAPSetupHTML();
 
 bool isPairingMode = false;
 unsigned long pairingStartTime = 0;
@@ -973,92 +978,186 @@ void drawHeader() {
 }
 
 void startWifiAP() {
-  if (serverInitialized) {
-    server.stop();
-    serverInitialized = false;
+  Serial.println("[HUB] Entering WiFi AP Setup Mode...");
+
+  // 1. Drain lingering touches from the button tap that opened AP mode
+  uint16_t tx, ty;
+  while (tft.getTouch(&tx, &ty)) {
+    delay(20);
   }
-  WiFi.mode(WIFI_AP_STA);
+  delay(150);
+
+  // 2. Configure and start SoftAP on Channel 1
   char apSSID[32];
   sprintf(apSSID, "HUB_%02X%02X", myMAC[4], myMAC[5]);
-  WiFi.softAP(apSSID, "12345678");
-  delay(200);
 
-  // Scan for nearby 2.4GHz WiFi networks
-  int n = WiFi.scanNetworks();
-  String netOptions = "<option value=''>-- Select Detected WiFi Network --</option>";
-  for (int i = 0; i < n && i < 20; i++) {
-    String s = WiFi.SSID(i);
-    if (s.length() > 0) {
-      int rssi = WiFi.RSSI(i);
-      int quality = constrain(2 * (rssi + 100), 0, 100);
-      netOptions += "<option value='" + s + "'>" + s + " (" + String(quality) + "% signal)</option>";
+  WiFi.mode(WIFI_AP_STA);
+  IPAddress apIP(192, 168, 4, 1);
+  IPAddress netMsk(255, 255, 255, 0);
+
+  bool apOk = WiFi.softAP(apSSID, "12345678", PAIRING_CHANNEL);
+  delay(100);
+  WiFi.softAPConfig(apIP, apIP, netMsk);
+  Serial.printf("[HUB] SoftAP started: %s, SSID='%s', IP=%s\n",
+                apOk ? "OK" : "FAILED", apSSID, WiFi.softAPIP().toString().c_str());
+
+  // 3. Start DNS Server for captive portal (port 53 wildcard)
+  dnsServer.stop();
+  dnsServer.setErrorReplyCode(DNSReplyCode::NoError);
+  dnsServer.start(53, "*", apIP);
+
+  // 4. Setup and start Web Server
+  setupServerRoutes();
+  server.begin();
+  inAPSetup = true;
+  newCredentialsSaved = false;
+
+  // 5. Draw clean AP UI with QR Code and Cancel button
+  tft.fillScreen(COLOR_BG);
+  tft.setTextColor(COLOR_HEADER);
+  tft.setTextSize(2);
+  tft.setCursor(15, 10);
+  tft.print("WIFI SETUP (HOTSPOT)");
+
+  tft.setTextColor(COLOR_WHITE);
+  tft.setTextSize(1);
+  tft.setCursor(15, 34);
+  tft.print("1. Connect Phone to: ");
+  tft.setTextColor(COLOR_CYAN);
+  tft.print(apSSID);
+
+  tft.setTextColor(COLOR_WHITE);
+  tft.setCursor(15, 48);
+  tft.print("   Password: ");
+  tft.setTextColor(COLOR_ACCENT);
+  tft.print("12345678");
+
+  tft.setTextColor(COLOR_WHITE);
+  tft.setCursor(15, 62);
+  tft.print("2. Open: ");
+  tft.setTextColor(0x07E0); // Green
+  tft.print("http://192.168.4.1");
+
+  // QR Code
+  char qrStr[64];
+  sprintf(qrStr, "WIFI:T:WPA;S:%s;P:12345678;;", apSSID);
+  QRCode qrcode;
+  uint8_t qrcodeData[qrcode_getBufferSize(3)];
+  qrcode_initText(&qrcode, qrcodeData, 3, 0, qrStr);
+  int scale = 3;
+  int offsetX = (320 - (qrcode.size * scale)) / 2;
+  int offsetY = 80;
+  tft.fillRect(offsetX - 4, offsetY - 4, (qrcode.size * scale) + 8, (qrcode.size * scale) + 8, COLOR_WHITE);
+  for (uint8_t y = 0; y < qrcode.size; y++) {
+    for (uint8_t x = 0; x < qrcode.size; x++) {
+      if (qrcode_getModule(&qrcode, x, y)) {
+        tft.fillRect(offsetX + x * scale, offsetY + y * scale, scale, scale, TFT_BLACK);
+      } else {
+        tft.fillRect(offsetX + x * scale, offsetY + y * scale, scale, scale, COLOR_WHITE);
+      }
     }
   }
 
-  char qrStr[64];
-  sprintf(qrStr, "WIFI:T:WPA;S:%s;P:12345678;;", apSSID);
-  inMenu = false;
-  drawQRCode(qrStr, "Scan with Phone:");
+  // Red Cancel Button at bottom
+  tft.fillRoundRect(60, 195, 200, 36, 6, COLOR_RED);
+  tft.drawRoundRect(60, 195, 200, 36, 6, COLOR_WHITE);
+  tft.setTextColor(COLOR_WHITE);
+  tft.setTextSize(2);
+  tft.setCursor(85, 205);
+  tft.print("CANCEL / BACK");
 
-  tft.setTextColor(TFT_WHITE);
-  tft.setTextSize(1);
-  tft.setCursor(10, 220);
-  tft.print("192.168.4.1  (tap screen to cancel)");
+  // Loop while in AP mode
+  int lastStationCount = -1;
+  while (inAPSetup) {
+    dnsServer.processNextRequest();
+    server.handleClient();
 
-  WebServer apServer(80);
-  DNSServer apDns;
-  apDns.setErrorReplyCode(DNSReplyCode::NoError);
-  apDns.start(53, "*", WiFi.softAPIP());
+    // Check station count & update TFT status
+    int stCount = WiFi.softAPgetStationNum();
+    if (stCount != lastStationCount) {
+      lastStationCount = stCount;
+      Serial.printf("[HUB-AP] Stations connected: %d\n", stCount);
+      tft.fillRect(15, 62, 290, 16, COLOR_BG);
+      tft.setCursor(15, 62);
+      if (stCount > 0) {
+        tft.setTextColor(0x07E0); // Green
+        tft.print("Phone connected! Open 192.168.4.1");
+      } else {
+        tft.setTextColor(COLOR_WHITE);
+        tft.print("2. Open: ");
+        tft.setTextColor(0x07E0); // Green
+        tft.print("http://192.168.4.1");
+      }
+    }
 
-  bool saved = false;
-  apServer.on("/", [&]() {
-    String pg = "<!DOCTYPE html><html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>WiFi Setup</title><style>body{background:#0f172a;color:#fff;font-family:sans-serif;padding:20px}select,input{width:100%;padding:12px;margin:8px 0;box-sizing:border-box;border-radius:6px;border:1px solid #334155;background:#1e293b;color:#fff;font-size:16px;}button{width:100%;padding:14px;background:#38bdf8;color:#0f172a;border:none;border-radius:6px;font-weight:bold;font-size:16px;cursor:pointer;margin-top:12px;}</style></head><body>";
-    pg += "<h2>AQUAPULSE WiFi Setup</h2><p style='color:#94a3b8'>Connect Hub to your home WiFi for remote dashboard access.</p>";
-    pg += "<form action='/save' method='GET'>";
-    pg += "<label style='color:#94a3b8;font-size:13px;'>SELECT DETECTED NETWORK:</label>";
-    pg += "<select onchange='if(this.value)document.getElementById(\"sInp\").value=this.value'>" + netOptions + "</select>";
-    pg += "<label style='color:#94a3b8;font-size:13px;'>NETWORK NAME (SSID):</label>";
-    pg += "<input id='sInp' name='s' value='" + hubSSID + "' placeholder='Network Name (SSID)' required>";
-    pg += "<label style='color:#94a3b8;font-size:13px;'>PASSWORD:</label>";
-    pg += "<input name='p' placeholder='WiFi Password' type='password'>";
-    pg += "<button type='submit'>Connect Hub to WiFi</button>";
-    pg += "</form></body></html>";
-    apServer.send(200, "text/html; charset=utf-8", pg);
-  });
-  apServer.on("/save", [&]() {
-    String s = apServer.arg("s");
-    String p = apServer.arg("p");
-    apServer.send(200, "text/html", "<html><body style='background:#0f172a;color:#fff;padding:20px;font-family:sans-serif;'><h2>Credentials Saved!</h2><p>Hub is rebooting and connecting to " + s + "...</p></body></html>");
-    delay(600);
-    Preferences pr;
-    pr.begin("hub", false);
-    pr.putString("ssid", s);
-    pr.putString("pass", p);
-    pr.end();
-    delay(400);
-    ESP.restart();
-  });
-  apServer.onNotFound([&]() {
-    apServer.sendHeader("Location", "http://192.168.4.1/", true);
-    apServer.send(302, "text/plain", "");
-  });
-  apServer.begin();
+    // Check Cancel touch: wait for finger lift to confirm deliberate tap
+    if (tft.getTouch(&tx, &ty)) {
+      if (tx >= 50 && tx <= 270 && ty >= 185 && ty <= 238) {
+        unsigned long pressStart = millis();
+        while (tft.getTouch(&tx, &ty)) {
+          if (millis() - pressStart > 3000) break;
+          delay(20);
+        }
+        delay(80);
+        Serial.println("[HUB] AP setup cancelled by user tap");
+        break;
+      }
+    }
 
-  while (!saved) {
-    apDns.processNextRequest();
-    apServer.handleClient();
-    uint16_t tx, ty;
-    if (tft.getTouch(&tx, &ty)) { delay(300); break; }
+    // Handle serial commands in AP mode
+    if (Serial.available()) {
+      String cmd = Serial.readStringUntil('\n');
+      cmd.trim();
+      if (cmd.startsWith("wifi set ") || cmd.startsWith("set wifi ")) {
+        String rest = cmd.startsWith("set wifi ") ? cmd.substring(9) : cmd.substring(9);
+        rest.trim();
+        int sp = rest.indexOf(' ');
+        String s = "", p = "";
+        if (sp > 0) {
+          s = rest.substring(0, sp);
+          p = rest.substring(sp + 1);
+        } else {
+          s = rest;
+          p = "";
+        }
+        s.trim(); p.trim();
+        if (s.length() > 0) {
+          Preferences pr;
+          pr.begin("hub", false);
+          pr.putString("ssid", s);
+          pr.putString("pass", p);
+          pr.end();
+          hubSSID = s; hubPASS = p;
+          newCredentialsSaved = true;
+          Serial.printf("[HUB] WiFi credentials set via serial: SSID='%s'\n", hubSSID.c_str());
+          break;
+        }
+      } else if (cmd.equalsIgnoreCase("cancel") || cmd.equalsIgnoreCase("exit") || cmd.equalsIgnoreCase("quit")) {
+        Serial.println("[HUB] Exiting AP setup mode via serial command");
+        break;
+      } else if (cmd.equalsIgnoreCase("status") || cmd.equalsIgnoreCase("wifi")) {
+        Serial.printf("[HUB-AP] Active! SSID='%s', IP=%s, Stations=%d\n",
+                      apSSID, WiFi.softAPIP().toString().c_str(), stCount);
+      }
+    }
+
     yield();
   }
-  apDns.stop();
-  apServer.stop();
+
+  // Cleanup AP mode
+  inAPSetup = false;
+  dnsServer.stop();
   WiFi.softAPdisconnect(true);
   WiFi.mode(WIFI_STA);
   esp_wifi_set_channel(PAIRING_CHANNEL, WIFI_SECOND_CHAN_NONE);
-  inMenu = true;
-  currentMenuPage = 4;
-  drawMenu();
+
+  if (newCredentialsSaved && hubSSID.length() > 0) {
+    connectToSavedWifi();
+  } else {
+    inMenu = true;
+    currentMenuPage = 4;
+    drawMenu();
+  }
 }
 
 void connectToSavedWifi() {
@@ -1152,7 +1251,7 @@ void drawQRCode(String url, String title) {
     tft.setTextSize(1);
     tft.setCursor(10, 35);
     char ssidStr[64];
-    sprintf(ssidStr, "WiFi: HUB_%02X%02X%02X%02X%02X%02X (12345678)", myMAC[0], myMAC[1], myMAC[2], myMAC[3], myMAC[4], myMAC[5]);
+    sprintf(ssidStr, "WiFi: HUB_%02X%02X  Pass: 12345678", myMAC[4], myMAC[5]);
     tft.print(ssidStr);
     
     QRCode qrcode;
@@ -1944,40 +2043,135 @@ String getPairingHTML() {
          "<a href='/' class='btn'>Back to Dashboard</a></body></html>";
 }
 
-#include "qrcode.h"
-void drawQRCode(const char *text, const char *title) {
-  tft.fillScreen(COLOR_BG);
-  tft.setTextColor(COLOR_CYAN);
-  tft.setTextSize(2);
-  tft.setCursor(20, 20);
-  tft.print(title);
-  
-  QRCode qrcode;
-  uint8_t qrcodeData[qrcode_getBufferSize(3)];
-  qrcode_initText(&qrcode, qrcodeData, 3, 0, text);
-  
-  int scale = 4;
-  int startX = (320 - (qrcode.size * scale)) / 2;
-  int startY = (240 - (qrcode.size * scale)) / 2 + 10;
-  
-  tft.fillRect(startX - 10, startY - 10, qrcode.size * scale + 20, qrcode.size * scale + 20, COLOR_WHITE);
-  
-  for (uint8_t y = 0; y < qrcode.size; y++) {
-    for (uint8_t x = 0; x < qrcode.size; x++) {
-      if (qrcode_getModule(&qrcode, x, y)) {
-        tft.fillRect(startX + x * scale, startY + y * scale, scale, scale, 0x0000);
-      }
-    }
-  }
+String getAPSetupHTML() {
+  String pg = "<!DOCTYPE html><html lang='en'><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>AquaPulse WiFi Setup</title><style>";
+  pg += "body{background:#0f172a;color:#f8fafc;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;margin:0;padding:20px;text-align:center}";
+  pg += ".box{max-width:380px;margin:20px auto;background:#1e293b;padding:24px;border-radius:12px;box-shadow:0 4px 6px -1px rgba(0,0,0,0.5);text-align:left}";
+  pg += "h2{margin-top:0;color:#38bdf8;font-size:22px;text-align:center;}";
+  pg += "label{font-size:13px;color:#94a3b8;display:block;margin-top:14px;font-weight:600}";
+  pg += "input{width:100%;padding:12px;margin:6px 0;box-sizing:border-box;border-radius:8px;border:1px solid #334155;background:#0f172a;color:#fff;font-size:16px;}";
+  pg += "button{width:100%;padding:14px;background:#0284c7;color:#fff;border:none;border-radius:8px;font-weight:bold;font-size:16px;cursor:pointer;margin-top:18px;}";
+  pg += "button:hover{background:#0369a1}";
+  pg += ".tip{background:#1e3a5f;border-left:4px solid #38bdf8;padding:8px 12px;border-radius:4px;font-size:12px;color:#cbd5e1;margin-top:16px;line-height:1.4;}";
+  pg += "</style></head><body><div class='box'>";
+  pg += "<h2>AquaPulse WiFi Setup</h2>";
+  pg += "<p style='color:#94a3b8;font-size:14px;margin-bottom:15px;text-align:center;'>Connect Hub to your 2.4GHz home Wi-Fi network.</p>";
+  pg += "<form action='/save' method='POST'>";
+  pg += "<label>NETWORK NAME (SSID):</label>";
+  pg += "<input id='sInp' name='s' value='" + hubSSID + "' placeholder='Enter your Wi-Fi name' required autofocus>";
+  pg += "<label>WI-FI PASSWORD:</label>";
+  pg += "<input name='p' placeholder='Enter Wi-Fi password' type='password'>";
+  pg += "<button type='submit' onclick=\"this.innerText='Saving & Connecting...';\">Save & Connect Hub</button>";
+  pg += "</form>";
+  pg += "<div class='tip'><b>Note:</b> Please ensure your router broadcasts on 2.4GHz. Once saved, the Hub screen will show its assigned IP address.</div>";
+  pg += "</div></body></html>";
+  return pg;
 }
 
+void setupServerRoutes() {
+  static bool routesSetup = false;
+  if (routesSetup) return;
+  routesSetup = true;
 
+  // Root endpoint: In AP mode serve setup portal, in STA mode serve dashboard
+  server.on("/", HTTP_ANY, []() {
+    if (inAPSetup) {
+      Serial.printf("[HUB-AP] Serving Setup Portal to client: %s\n",
+                    server.client().remoteIP().toString().c_str());
+      server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+      server.sendHeader("Pragma", "no-cache");
+      server.sendHeader("Expires", "-1");
+      server.sendHeader("Connection", "close");
+      server.send(200, "text/html; charset=utf-8", getAPSetupHTML());
+    } else {
+      server.send(200, "text/html", getDashboardHTML());
+    }
+  });
 
+  // Fast 204 handler for icons so browsers don't block sockets waiting for icons
+  auto handleIcon204 = []() {
+    server.send(204, "text/plain", "");
+  };
+  server.on("/favicon.ico", HTTP_ANY, handleIcon204);
+  server.on("/apple-touch-icon.png", HTTP_ANY, handleIcon204);
+  server.on("/apple-touch-icon-precomposed.png", HTTP_ANY, handleIcon204);
 
-void initWebServer() {
-  if (serverInitialized) return;
+  // Apple Captive Network Assistant probes
+  auto handleAppleProbe = []() {
+    if (inAPSetup) {
+      Serial.println("[HUB-AP] Apple CNA probe -> Serving Setup Portal");
+      server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+      server.sendHeader("Pragma", "no-cache");
+      server.sendHeader("Expires", "-1");
+      server.sendHeader("Connection", "close");
+      server.send(200, "text/html; charset=utf-8", getAPSetupHTML());
+    } else {
+      server.send(200, "text/html", getDashboardHTML());
+    }
+  };
+  server.on("/hotspot-detect.html", HTTP_ANY, handleAppleProbe);
+  server.on("/canonical.html", HTTP_ANY, handleAppleProbe);
 
-  server.on("/", []() { server.send(200, "text/html", getDashboardHTML()); });
+  // Android / Chrome Captive Portal probes: 302 Redirect to http://192.168.4.1/
+  auto handleAndroidProbe = []() {
+    if (inAPSetup) {
+      Serial.println("[HUB-AP] Android captive probe -> 302 Redirect to 192.168.4.1");
+      server.sendHeader("Location", "http://192.168.4.1/", true);
+      server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+      server.sendHeader("Connection", "close");
+      server.send(302, "text/html", "<!DOCTYPE html><html><head><meta http-equiv='refresh' content='0;url=http://192.168.4.1/'></head><body><a href='http://192.168.4.1/'>AquaPulse WiFi Setup</a></body></html>");
+    } else {
+      server.send(204, "text/plain", "");
+    }
+  };
+  server.on("/generate_204", HTTP_ANY, handleAndroidProbe);
+  server.on("/gen_204", HTTP_ANY, handleAndroidProbe);
+
+  // Windows probes
+  server.on("/ncsi.txt", HTTP_ANY, []() {
+    server.send(200, "text/plain", "Microsoft NCSI");
+  });
+  server.on("/connecttest.txt", HTTP_ANY, []() {
+    if (inAPSetup) {
+      server.sendHeader("Location", "http://192.168.4.1/", true);
+      server.sendHeader("Connection", "close");
+      server.send(302, "text/html", "<meta http-equiv='refresh' content='0;url=http://192.168.4.1/'>");
+    } else {
+      server.send(200, "text/plain", "Microsoft Connect Test");
+    }
+  });
+
+  // Save WiFi credentials
+  auto handleSaveWifi = []() {
+    String s = server.hasArg("s") ? server.arg("s") : "";
+    String p = server.hasArg("p") ? server.arg("p") : "";
+    s.trim();
+    p.trim();
+    Serial.printf("[HUB-AP] Received WiFi credentials: SSID='%s'\n", s.c_str());
+    String resp = "<!DOCTYPE html><html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'><style>body{background:#0f172a;color:#fff;font-family:sans-serif;text-align:center;padding:40px;}</style></head><body>";
+    resp += "<h2 style='color:#22c55e'>Credentials Saved!</h2><p>Connecting Hub to <b>" + s + "</b>...</p><p style='color:#94a3b8'>Please look at the Hub screen.</p></body></html>";
+    server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+    server.sendHeader("Connection", "close");
+    server.send(200, "text/html; charset=utf-8", resp);
+
+    if (s.length() > 0) {
+      Preferences pr;
+      pr.begin("hub", false);
+      pr.putString("ssid", s);
+      pr.putString("pass", p);
+      pr.end();
+      hubSSID = s;
+      hubPASS = p;
+      newCredentialsSaved = true;
+    }
+    // Allow response packets to fully flush to client before closing AP!
+    delay(1000);
+    inAPSetup = false;
+  };
+
+  server.on("/save", HTTP_ANY, handleSaveWifi);
+  server.on("/savewifi", HTTP_ANY, handleSaveWifi);
+
   server.on("/pairing", []() { server.send(200, "text/html", getPairingHTML()); });
   server.on("/testbuzzer", []() {
     triggerBuzzerTest();
@@ -1997,18 +2191,48 @@ void initWebServer() {
     forceRedraw = true;
     server.send(200, "text/html", "<!DOCTYPE html><html><head><meta http-equiv='refresh' content='2;url=/'><style>body{background:#0f172a;color:#fff;font-family:sans-serif;text-align:center;padding:50px}</style></head><body><h2>Calibration Saved!</h2><p>Redirecting to dashboard...</p></body></html>");
   });
-  server.on("/savewifi", []() {
-    hubPrefs.begin("hub", false);
-    hubPrefs.putString("ssid", server.arg("s"));
-    hubPrefs.putString("pass", server.arg("p"));
-    hubPrefs.end();
-    server.send(200, "text/html", "<html><body style='background:#0f172a;color:#fff;font-family:sans-serif;padding:20px'><h2>Saved! Rebooting...</h2></body></html>");
-    delay(1000);
-    ESP.restart();
+
+  server.onNotFound([]() {
+    if (inAPSetup) {
+      String uri = server.uri();
+      Serial.printf("[HUB-AP] onNotFound: Host='%s', URI='%s', Client=%s\n",
+                    server.hostHeader().c_str(), uri.c_str(),
+                    server.client().remoteIP().toString().c_str());
+
+      // If it's an image or static asset, return 204
+      if (uri.endsWith(".ico") || uri.endsWith(".png") || uri.endsWith(".jpg") || uri.endsWith(".svg")) {
+        server.send(204, "text/plain", "");
+        return;
+      }
+
+      // If external domain request (captive portal redirect needed)
+      String host = server.hostHeader();
+      if (!host.startsWith("192.168.4.1")) {
+        server.sendHeader("Location", "http://192.168.4.1/", true);
+        server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+        server.sendHeader("Connection", "close");
+        server.send(302, "text/html", "<!DOCTYPE html><html><head><meta http-equiv='refresh' content='0;url=http://192.168.4.1/'></head><body><p>Redirecting to <a href='http://192.168.4.1/'>AquaPulse WiFi Setup</a>...</p></body></html>");
+      } else {
+        // Direct access to 192.168.4.1 with any path -> directly serve setup HTML!
+        server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+        server.sendHeader("Pragma", "no-cache");
+        server.sendHeader("Expires", "-1");
+        server.sendHeader("Connection", "close");
+        server.send(200, "text/html; charset=utf-8", getAPSetupHTML());
+      }
+    } else {
+      server.send(404, "text/plain", "Not Found");
+    }
   });
-  server.begin();
-  serverInitialized = true;
-  Serial.printf("[HUB] WebServer online! IP: %s\n", WiFi.localIP().toString().c_str());
+}
+
+void initWebServer() {
+  setupServerRoutes();
+  if (!serverInitialized) {
+    server.begin();
+    serverInitialized = true;
+    Serial.printf("[HUB] WebServer online! IP: %s\n", WiFi.localIP().toString().c_str());
+  }
 }
 
 uint16_t getDistColor(int percent) {
@@ -2550,6 +2774,31 @@ void loop() {
     } else if (cmd.equalsIgnoreCase("wifi setup") || cmd.equalsIgnoreCase("wifisetup") || cmd.equalsIgnoreCase("ap")) {
       Serial.println("[HUB] Starting WiFi setup AP...");
       startWifiAP();
+    } else if (cmd.startsWith("wifi set ") || cmd.startsWith("set wifi ")) {
+      String rest = cmd.startsWith("set wifi ") ? cmd.substring(9) : cmd.substring(9);
+      rest.trim();
+      int sp = rest.indexOf(' ');
+      String s = "", p = "";
+      if (sp > 0) {
+        s = rest.substring(0, sp);
+        p = rest.substring(sp + 1);
+      } else {
+        s = rest;
+        p = "";
+      }
+      s.trim();
+      p.trim();
+      if (s.length() > 0) {
+        Preferences pr;
+        pr.begin("hub", false);
+        pr.putString("ssid", s);
+        pr.putString("pass", p);
+        pr.end();
+        hubSSID = s;
+        hubPASS = p;
+        Serial.printf("[HUB] Saved WiFi to NVS: SSID='%s', connecting...\n", hubSSID.c_str());
+        connectToSavedWifi();
+      }
     } else if (cmd.equalsIgnoreCase("save") || cmd.equalsIgnoreCase("savecalib")) {
       hubSaveCalibration();
       Serial.println("[HUB] Tank config successfully saved into NVS!");
