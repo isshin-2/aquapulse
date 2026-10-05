@@ -126,9 +126,35 @@ void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
   Serial.print("[NODE] Send Status: ");
   Serial.println(ok ? "Success" : "Fail");
   if (ok) {
+    if (sendFailures > 0) {
+      Serial.printf("[NODE] Communication re-established on Ch %d!\n", currentChan);
+      nodeSaveNVS();
+    }
     sendFailures = 0;
   } else {
     lastSentMm = -1; // Force retry on next cycle
+    sendFailures++;
+    // Hop channels after 3 consecutive failures to re-lock onto Hub if it changed channel
+    if (sendFailures >= 3 && (sendFailures % 2 == 0)) {
+      currentChan = (currentChan % 13) + 1;
+      esp_wifi_set_channel(currentChan, WIFI_SECOND_CHAN_NONE);
+      if (esp_now_is_peer_exist(hubMAC)) {
+        esp_now_peer_info_t p = {};
+        memcpy(p.peer_addr, hubMAC, 6);
+        p.channel = currentChan;
+        p.encrypt = false;
+        esp_now_mod_peer(&p);
+      }
+      uint8_t bcastMac[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+      if (esp_now_is_peer_exist(bcastMac)) {
+        esp_now_peer_info_t bcast = {};
+        memcpy(bcast.peer_addr, bcastMac, 6);
+        bcast.channel = currentChan;
+        bcast.encrypt = false;
+        esp_now_mod_peer(&bcast);
+      }
+      Serial.printf("[NODE] Send failed %d times -> hopped to Ch %d\n", sendFailures, currentChan);
+    }
   }
 }
 
@@ -143,7 +169,7 @@ void sendPairingRequest(const uint8_t *targetMAC, uint16_t code) {
   if (!esp_now_is_peer_exist(targetMAC)) {
     esp_now_peer_info_t p = {};
     memcpy(p.peer_addr, targetMAC, 6);
-    p.channel = PAIRING_CHANNEL;
+    p.channel = currentChan;
     p.encrypt = false;
     esp_now_add_peer(&p);
   }
@@ -173,16 +199,26 @@ void OnDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
     // Lock onto hub channel from beacon
     uint8_t hubChan = b->channel > 0 && b->channel <= 13 ? b->channel : PAIRING_CHANNEL;
     if (currentChan != hubChan) {
+      Serial.printf("[NODE] Hub channel changed from %d to %d! Switching...\n", currentChan, hubChan);
       currentChan = hubChan;
       esp_wifi_set_channel(currentChan, WIFI_SECOND_CHAN_NONE);
       // Re-register broadcast peer on new channel
       uint8_t bcastMac[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
-      esp_now_del_peer(bcastMac);
+      if (esp_now_is_peer_exist(bcastMac)) esp_now_del_peer(bcastMac);
       esp_now_peer_info_t bcast = {};
       memset(bcast.peer_addr, 0xFF, 6);
       bcast.channel = currentChan;
       bcast.encrypt = false;
       esp_now_add_peer(&bcast);
+
+      if (paired && esp_now_is_peer_exist(hubMAC)) {
+        esp_now_peer_info_t hp = {};
+        memcpy(hp.peer_addr, hubMAC, 6);
+        hp.channel = currentChan;
+        hp.encrypt = false;
+        esp_now_mod_peer(&hp);
+      }
+      nodeSaveNVS();
     }
     if (paired) {
       // Already paired - only respond if it's the SAME hub (allow re-pairing after hub restart)
@@ -422,17 +458,19 @@ void setup() {
   // Load saved pairing from NVS
   nodeLoadNVS();
   if (paired) {
-    Serial.print("[NODE] Restored pairing - Hub: "); printMAC(hubMAC); Serial.println();
-    // Register hub peer (we still listen for beacons to re-sync if needed)
+    Serial.print("[NODE] Restored pairing - Hub: "); printMAC(hubMAC); Serial.printf(" on Ch %d\n", currentChan);
+    esp_wifi_set_channel(currentChan, WIFI_SECOND_CHAN_NONE);
+    // Register hub peer
     if (!esp_now_is_peer_exist(hubMAC)) {
       esp_now_peer_info_t peerInfo = {};
       memcpy(peerInfo.peer_addr, hubMAC, 6);
-      peerInfo.channel = PAIRING_CHANNEL;
+      peerInfo.channel = currentChan;
       peerInfo.encrypt = false;
       esp_now_add_peer(&peerInfo);
     }
-    currentChan = PAIRING_CHANNEL;
   } else {
+    currentChan = PAIRING_CHANNEL;
+    esp_wifi_set_channel(PAIRING_CHANNEL, WIFI_SECOND_CHAN_NONE);
     Serial.println("[NODE] No saved pairing - listening on ch1 for Hub beacon...");
   }
 }
@@ -527,11 +565,13 @@ void loop() {
       }
     }
 
-    // After 20 consecutive send failures, assume hub changed channel or reset
-    if (sendFailures >= 20) {
-      Serial.println("[NODE] Too many failures — clearing NVS, restarting...");
-      nodeClearNVS();
-      ESP.restart();
+    // Keep pairing safe — NEVER wipe NVS on send failures!
+    if (sendFailures >= 30) {
+      static unsigned long lastFailLog = 0;
+      if (millis() - lastFailLog > 5000) {
+        lastFailLog = millis();
+        Serial.printf("[NODE] Searching for Hub across channels... current Ch %d, fail count: %d\n", currentChan, sendFailures);
+      }
     }
   }
   delay(10);
@@ -549,9 +589,14 @@ void loop() {
 #include <DNSServer.h>
 #include "qrcode.h"
 #include <WiFi.h>
+#include <WiFiUdp.h>
 #include <Preferences.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
 bool invalidateCache = false;
 DNSServer dnsServer;
+WiFiUDP captiveDnsServer;
+void processCaptiveDNS(const IPAddress& apIP);
 bool isAPMode = false;
 String hubSSID = "";
 String hubPASS = "";
@@ -568,6 +613,10 @@ void startWifiAP();
 void connectToSavedWifi();
 void initWebServerAndOTA();
 void broadcastBeacon();
+void notifyNodesChannelSwitch(uint8_t fromChannel, uint8_t newChannel);
+void notifyNodesChannelSwitch(uint8_t newChannel);
+void refreshEspNowPeers();
+void checkAndPerformGitHubOTA();
 
 #include <esp_now.h>
 #include <esp_wifi.h>
@@ -901,7 +950,7 @@ void OnDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
         PairingConfirm conf = {};
         strncpy(conf.magic, "WLMSCONF", 8);
         memcpy(conf.hubMAC, myMAC, 6);
-        conf.deviceId = req->deviceId;
+        conf.deviceId = (req->deviceId > 0) ? req->deviceId : (i + 1);
         conf.accepted = true;
         conf.auth = pairAuth((uint8_t*)&conf, sizeof(PairingConfirm) - sizeof(conf.auth));
         esp_now_send(mac, (uint8_t *)&conf, sizeof(PairingConfirm));
@@ -978,6 +1027,58 @@ void drawHeader() {
   tft.print("MENU");
 }
 
+void processCaptiveDNS(const IPAddress& apIP) {
+  int packetSize = captiveDnsServer.parsePacket();
+  if (packetSize >= 12) {
+    uint8_t buf[256];
+    int len = captiveDnsServer.read(buf, sizeof(buf));
+    if (len >= 12) {
+      // Process standard DNS queries (QR == 0)
+      if ((buf[2] & 0x80) == 0) {
+        buf[2] = 0x81; // Standard query response, recursion desired
+        buf[3] = 0x80; // Recursion available, No error
+        buf[6] = 0x00; // ANCOUNT = 1
+        buf[7] = 0x01;
+        buf[8] = 0x00; // NSCOUNT = 0
+        buf[9] = 0x00;
+        buf[10] = 0x00; // ARCOUNT = 0 (strip EDNS0 to prevent client mismatches)
+        buf[11] = 0x00;
+
+        int idx = 12;
+        while (idx < len && buf[idx] != 0) {
+          idx += (buf[idx] + 1);
+        }
+        if (idx < len && buf[idx] == 0) {
+          idx++;    // skip terminating 0x00 byte
+          idx += 4; // skip QTYPE (2 bytes) + QCLASS (2 bytes)
+          if (idx + 16 <= (int)sizeof(buf)) {
+            buf[idx++] = 0xC0; // Compression pointer to QNAME at byte 12
+            buf[idx++] = 0x0C;
+            buf[idx++] = 0x00; // Type A
+            buf[idx++] = 0x01;
+            buf[idx++] = 0x00; // Class IN
+            buf[idx++] = 0x01;
+            buf[idx++] = 0x00; // TTL: 60s
+            buf[idx++] = 0x00;
+            buf[idx++] = 0x00;
+            buf[idx++] = 0x3C;
+            buf[idx++] = 0x00; // Data length: 4 bytes
+            buf[idx++] = 0x04;
+            buf[idx++] = apIP[0];
+            buf[idx++] = apIP[1];
+            buf[idx++] = apIP[2];
+            buf[idx++] = apIP[3];
+
+            captiveDnsServer.beginPacket(captiveDnsServer.remoteIP(), captiveDnsServer.remotePort());
+            captiveDnsServer.write(buf, idx);
+            captiveDnsServer.endPacket();
+          }
+        }
+      }
+    }
+  }
+}
+
 void startWifiAP() {
   Serial.println("[HUB] Entering WiFi AP Setup Mode...");
 
@@ -986,34 +1087,132 @@ void startWifiAP() {
   while (tft.getTouch(&tx, &ty)) {
     delay(20);
   }
-  delay(150);
+  delay(100);
 
-  // 2. Configure and start SoftAP on Channel 1
+  // 2. Show Scanning Screen on TFT
+  tft.fillScreen(COLOR_BG);
+  tft.setTextColor(COLOR_HEADER);
+  tft.setTextSize(2);
+  tft.setCursor(15, 20);
+  tft.print("WIFI SETUP (HOTSPOT)");
+
+  tft.setTextColor(COLOR_CYAN);
+  tft.setTextSize(2);
+  tft.setCursor(15, 60);
+  tft.print("SCANNING WI-FI...");
+
+  tft.setTextColor(COLOR_WHITE);
+  tft.setTextSize(1);
+  tft.setCursor(15, 95);
+  tft.print("Searching for 2.4GHz networks...");
+  tft.setCursor(15, 115);
+  tft.print("Hotspot will start shortly.");
+
+  tft.drawRoundRect(20, 145, 280, 14, 7, COLOR_DARK_GRAY);
+  tft.fillRoundRect(22, 147, 60, 10, 5, COLOR_ACCENT);
+
+  // 3. Perform scan in STA mode
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  delay(100);
+
+  int n = WiFi.scanNetworks(false, false, false, 300);
+  Serial.printf("[HUB] WiFi scan completed: %d networks found\n", n);
+
+  tft.fillRoundRect(22, 147, 276, 10, 5, COLOR_ACCENT);
+
+  // Process networks into scannedNetworksHTML
+  scannedNetworksHTML = "";
+  if (n > 0) {
+    struct NetEntry {
+      String ssid;
+      int32_t rssi;
+      uint8_t channel;
+    };
+    NetEntry uniqueNets[20];
+    int netCount = 0;
+
+    for (int i = 0; i < n && netCount < 20; i++) {
+      String s = WiFi.SSID(i);
+      s.trim();
+      if (s.length() == 0) continue;
+
+      int foundIdx = -1;
+      for (int u = 0; u < netCount; u++) {
+        if (uniqueNets[u].ssid.equals(s)) {
+          foundIdx = u;
+          break;
+        }
+      }
+
+      int32_t r = WiFi.RSSI(i);
+      uint8_t ch = WiFi.channel(i);
+      if (foundIdx >= 0) {
+        if (r > uniqueNets[foundIdx].rssi) {
+          uniqueNets[foundIdx].rssi = r;
+          uniqueNets[foundIdx].channel = ch;
+        }
+      } else {
+        uniqueNets[netCount].ssid = s;
+        uniqueNets[netCount].rssi = r;
+        uniqueNets[netCount].channel = ch;
+        netCount++;
+      }
+    }
+
+    // Sort descending by RSSI
+    for (int i = 0; i < netCount - 1; i++) {
+      for (int j = i + 1; j < netCount; j++) {
+        if (uniqueNets[j].rssi > uniqueNets[i].rssi) {
+          NetEntry tmp = uniqueNets[i];
+          uniqueNets[i] = uniqueNets[j];
+          uniqueNets[j] = tmp;
+        }
+      }
+    }
+
+    scannedNetworksHTML = "<label>SELECT NEARBY NETWORK:</label>";
+    scannedNetworksHTML += "<select id='netSelect' onchange=\"document.getElementById('sInp').value=this.value;\" style='width:100%;padding:12px;margin:6px 0 12px;box-sizing:border-box;border-radius:8px;border:1px solid #334155;background:#0f172a;color:#fff;font-size:15px;'>";
+    scannedNetworksHTML += "<option value=''>-- Tap to select Wi-Fi network --</option>";
+    for (int i = 0; i < netCount; i++) {
+      int r = uniqueNets[i].rssi;
+      const char* bars = (r >= -60) ? " [||||]" : (r >= -70 ? " [||| ]" : (r >= -80 ? " [||  ]" : " [|   ]"));
+      scannedNetworksHTML += "<option value='" + uniqueNets[i].ssid + "'>";
+      scannedNetworksHTML += uniqueNets[i].ssid + " (Ch " + String(uniqueNets[i].channel) + bars + ")</option>";
+    }
+    scannedNetworksHTML += "</select>";
+  } else {
+    scannedNetworksHTML = "<p style='color:#94a3b8;font-size:13px;'>No broadcasted networks found. You can enter your SSID below.</p>";
+  }
+
+  // 4. Configure and start SoftAP on Channel 1
   char apSSID[32];
   sprintf(apSSID, "HUB_%02X%02X", myMAC[4], myMAC[5]);
 
   WiFi.mode(WIFI_AP_STA);
+  WiFi.setSleep(false); // Disable modem sleep so radio stays 100% responsive
+  esp_wifi_set_ps(WIFI_PS_NONE);
+
   IPAddress apIP(192, 168, 4, 1);
   IPAddress netMsk(255, 255, 255, 0);
 
-  bool apOk = WiFi.softAP(apSSID, "12345678", PAIRING_CHANNEL);
-  delay(100);
   WiFi.softAPConfig(apIP, apIP, netMsk);
+  bool apOk = WiFi.softAP(apSSID, "12345678", PAIRING_CHANNEL);
+  delay(50);
   Serial.printf("[HUB] SoftAP started: %s, SSID='%s', IP=%s\n",
                 apOk ? "OK" : "FAILED", apSSID, WiFi.softAPIP().toString().c_str());
 
-  // 3. Start DNS Server for captive portal (port 53 wildcard)
-  dnsServer.stop();
-  dnsServer.setErrorReplyCode(DNSReplyCode::NoError);
-  dnsServer.start(53, "*", apIP);
+  // 5. Start custom Captive DNS Server (UDP port 53)
+  captiveDnsServer.stop();
+  captiveDnsServer.begin(53);
 
-  // 4. Setup and start Web Server
+  // 6. Setup and start Web Server
   setupServerRoutes();
   server.begin();
   inAPSetup = true;
   newCredentialsSaved = false;
 
-  // 5. Draw clean AP UI with QR Code and Cancel button
+  // 7. Draw clean AP UI with QR Code and Cancel button
   tft.fillScreen(COLOR_BG);
   tft.setTextColor(COLOR_HEADER);
   tft.setTextSize(2);
@@ -1022,22 +1221,28 @@ void startWifiAP() {
 
   tft.setTextColor(COLOR_WHITE);
   tft.setTextSize(1);
-  tft.setCursor(15, 34);
+  tft.setCursor(15, 32);
   tft.print("1. Connect Phone to: ");
   tft.setTextColor(COLOR_CYAN);
   tft.print(apSSID);
 
   tft.setTextColor(COLOR_WHITE);
-  tft.setCursor(15, 48);
+  tft.setCursor(15, 44);
   tft.print("   Password: ");
   tft.setTextColor(COLOR_ACCENT);
   tft.print("12345678");
 
   tft.setTextColor(COLOR_WHITE);
-  tft.setCursor(15, 62);
+  tft.setCursor(15, 56);
   tft.print("2. Open: ");
-  tft.setTextColor(0x07E0); // Green
+  tft.setTextColor(COLOR_CYAN);
   tft.print("http://192.168.4.1");
+
+  // Small dedicated status line at y=68 (never overwrites line 2 instructions)
+  tft.setTextSize(1);
+  tft.setCursor(15, 68);
+  tft.setTextColor(0x8410); // Gray
+  tft.print("Status: Waiting for phone...");
 
   // QR Code
   char qrStr[64];
@@ -1047,7 +1252,7 @@ void startWifiAP() {
   qrcode_initText(&qrcode, qrcodeData, 3, 0, qrStr);
   int scale = 3;
   int offsetX = (320 - (qrcode.size * scale)) / 2;
-  int offsetY = 80;
+  int offsetY = 82;
   tft.fillRect(offsetX - 4, offsetY - 4, (qrcode.size * scale) + 8, (qrcode.size * scale) + 8, COLOR_WHITE);
   for (uint8_t y = 0; y < qrcode.size; y++) {
     for (uint8_t x = 0; x < qrcode.size; x++) {
@@ -1069,39 +1274,49 @@ void startWifiAP() {
 
   // Loop while in AP mode
   int lastStationCount = -1;
+  unsigned long lastStationCheck = 0;
+  unsigned long lastTouchCheck = 0;
+
   while (inAPSetup) {
-    dnsServer.processNextRequest();
+    processCaptiveDNS(apIP);
     server.handleClient();
 
-    // Check station count & update TFT status
-    int stCount = WiFi.softAPgetStationNum();
-    if (stCount != lastStationCount) {
-      lastStationCount = stCount;
-      Serial.printf("[HUB-AP] Stations connected: %d\n", stCount);
-      tft.fillRect(15, 62, 290, 16, COLOR_BG);
-      tft.setCursor(15, 62);
-      if (stCount > 0) {
-        tft.setTextColor(0x07E0); // Green
-        tft.print("Phone connected! Open 192.168.4.1");
-      } else {
-        tft.setTextColor(COLOR_WHITE);
-        tft.print("2. Open: ");
-        tft.setTextColor(0x07E0); // Green
-        tft.print("http://192.168.4.1");
+    unsigned long now = millis();
+
+    // Check station count & update TFT status every 300ms
+    if (now - lastStationCheck >= 300) {
+      lastStationCheck = now;
+      int stCount = WiFi.softAPgetStationNum();
+      if (stCount != lastStationCount) {
+        lastStationCount = stCount;
+        Serial.printf("[HUB-AP] Stations connected: %d\n", stCount);
+        tft.fillRect(15, 68, 290, 10, COLOR_BG);
+        tft.setTextSize(1);
+        tft.setCursor(15, 68);
+        if (stCount > 0) {
+          tft.setTextColor(0x07E0); // Bright green
+          tft.print("* Phone connected");
+        } else {
+          tft.setTextColor(0x8410); // Gray
+          tft.print("Status: Waiting for phone...");
+        }
       }
     }
 
-    // Check Cancel touch: wait for finger lift to confirm deliberate tap
-    if (tft.getTouch(&tx, &ty)) {
-      if (tx >= 50 && tx <= 270 && ty >= 185 && ty <= 238) {
-        unsigned long pressStart = millis();
-        while (tft.getTouch(&tx, &ty)) {
-          if (millis() - pressStart > 3000) break;
-          delay(20);
+    // Check Cancel touch every 50ms
+    if (now - lastTouchCheck >= 50) {
+      lastTouchCheck = now;
+      if (tft.getTouch(&tx, &ty)) {
+        if (tx >= 50 && tx <= 270 && ty >= 185 && ty <= 238) {
+          unsigned long pressStart = millis();
+          while (tft.getTouch(&tx, &ty)) {
+            if (millis() - pressStart > 3000) break;
+            delay(20);
+          }
+          delay(80);
+          Serial.println("[HUB] AP setup cancelled by user tap");
+          break;
         }
-        delay(80);
-        Serial.println("[HUB] AP setup cancelled by user tap");
-        break;
       }
     }
 
@@ -1138,16 +1353,16 @@ void startWifiAP() {
         break;
       } else if (cmd.equalsIgnoreCase("status") || cmd.equalsIgnoreCase("wifi")) {
         Serial.printf("[HUB-AP] Active! SSID='%s', IP=%s, Stations=%d\n",
-                      apSSID, WiFi.softAPIP().toString().c_str(), stCount);
+                      apSSID, WiFi.softAPIP().toString().c_str(), WiFi.softAPgetStationNum());
       }
     }
 
-    yield();
+    delay(5); // Essential: yields timeslices to FreeRTOS lwIP TCP/IP stack
   }
 
   // Cleanup AP mode
   inAPSetup = false;
-  dnsServer.stop();
+  captiveDnsServer.stop();
   WiFi.softAPdisconnect(true);
   WiFi.mode(WIFI_STA);
   esp_wifi_set_channel(PAIRING_CHANNEL, WIFI_SECOND_CHAN_NONE);
@@ -1157,6 +1372,7 @@ void startWifiAP() {
   } else {
     inMenu = true;
     currentMenuPage = 4;
+    while (tft.getTouch(&tx, &ty)) delay(20);
     drawMenu();
   }
 }
@@ -1167,68 +1383,134 @@ void connectToSavedWifi() {
     return;
   }
   
-  // Show pop-up on TFT screen
-  tft.fillRect(20, 60, 280, 120, COLOR_DARK_GRAY);
-  tft.drawRect(20, 60, 280, 120, COLOR_CYAN);
+  // 1. Drain lingering touches
+  uint16_t tx, ty;
+  while (tft.getTouch(&tx, &ty)) delay(20);
+
+  // 2. Show connecting box on TFT
+  tft.fillRect(20, 50, 280, 140, COLOR_DARK_GRAY);
+  tft.drawRect(20, 50, 280, 140, COLOR_CYAN);
   tft.setTextColor(COLOR_WHITE);
   tft.setTextSize(2);
-  tft.setCursor(35, 75);
+  tft.setCursor(35, 65);
   tft.print("Connecting to WiFi:");
   tft.setTextColor(COLOR_ACCENT);
   tft.setTextSize(1);
-  tft.setCursor(35, 102);
+  tft.setCursor(35, 92);
   tft.print(hubSSID);
   tft.setTextColor(COLOR_CYAN);
-  tft.setCursor(35, 122);
-  tft.print("Please wait...");
+  tft.setCursor(35, 110);
+  tft.print("Syncing nodes & connecting...");
 
+  // 3. Find target router channel
+  uint8_t targetChannel = PAIRING_CHANNEL;
   WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  delay(50);
+  int n = WiFi.scanNetworks(false, false, false, 300);
+  for (int i = 0; i < n; i++) {
+    if (WiFi.SSID(i).equals(hubSSID)) {
+      targetChannel = WiFi.channel(i);
+      Serial.printf("[HUB] Target router channel for '%s': Ch %d\n", hubSSID.c_str(), targetChannel);
+      break;
+    }
+  }
+
+  // 4. Send channel switch notification beacons to nodes on Channel 1 BEFORE leaving Channel 1
+  esp_wifi_set_channel(PAIRING_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  delay(30);
+  notifyNodesChannelSwitch(PAIRING_CHANNEL, targetChannel);
+  delay(100);
+
+  // 5. Connect to Wi-Fi
   WiFi.begin(hubSSID.c_str(), hubPASS.c_str());
 
   unsigned long start = millis();
   int dotCount = 0;
-  while (WiFi.status() != WL_CONNECTED && millis() - start < 9000) {
+  tft.setCursor(35, 130);
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 10000) {
     delay(300);
     tft.print(".");
     dotCount++;
-    if (dotCount % 8 == 0) {
-      tft.fillRect(35, 138, 250, 15, COLOR_DARK_GRAY);
-      tft.setCursor(35, 138);
+    if (dotCount % 12 == 0) {
+      tft.fillRect(35, 130, 250, 15, COLOR_DARK_GRAY);
+      tft.setCursor(35, 130);
     }
   }
 
-  if (WiFi.status() == WL_CONNECTED) {
-    tft.fillRect(20, 60, 280, 120, COLOR_DARK_GRAY);
-    tft.drawRect(20, 60, 280, 120, 0x07E0); // Bright green
+  bool ok = (WiFi.status() == WL_CONNECTED);
+  if (ok) {
+    WiFi.setSleep(false);
+    esp_wifi_set_ps(WIFI_PS_NONE);
+
+    uint8_t activeChannel = WiFi.channel();
+    Serial.printf("[HUB] Connected to WiFi! Active Channel: %d, IP: %s\n",
+                  activeChannel, WiFi.localIP().toString().c_str());
+
+    // If active channel differs from target, notify nodes again
+    if (activeChannel != targetChannel) {
+      notifyNodesChannelSwitch(activeChannel);
+    }
+
+    refreshEspNowPeers();
+
+    tft.fillRect(20, 50, 280, 140, COLOR_DARK_GRAY);
+    tft.drawRect(20, 50, 280, 140, 0x07E0); // Bright green
     tft.setTextColor(0x07E0);
     tft.setTextSize(2);
-    tft.setCursor(35, 75);
+    tft.setCursor(35, 65);
     tft.print("CONNECTED!");
     tft.setTextColor(COLOR_WHITE);
     tft.setTextSize(1);
-    tft.setCursor(35, 102);
-    tft.print("IP: "); tft.print(WiFi.localIP());
-    tft.setCursor(35, 122);
+    tft.setCursor(35, 95);
+    char chBuf[32];
+    sprintf(chBuf, "IP: %s (Ch %d)", WiFi.localIP().toString().c_str(), activeChannel);
+    tft.print(chBuf);
+    tft.setCursor(35, 115);
     tft.print("OTA & Web Ready!");
-    
+    tft.setCursor(35, 135);
+    tft.setTextColor(COLOR_ACCENT);
+    tft.print("Nodes synchronized.");
+
     initWebServerAndOTA();
-    delay(1800);
+    delay(2000);
+
+    // Return cleanly to Home Dashboard!
+    inMenu = false;
+    isPairingMode = false;
+    while (tft.getTouch(&tx, &ty)) delay(20);
+    tft.fillScreen(COLOR_BG);
+    lastRenderedPage = -1;
+    invalidateCache = true;
+    forceRedraw = true;
+    drawDisplay(true);
   } else {
-    tft.fillRect(20, 60, 280, 120, COLOR_DARK_GRAY);
-    tft.drawRect(20, 60, 280, 120, COLOR_RED);
+    Serial.println("[HUB] WiFi connection failed!");
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_STA);
+    esp_wifi_set_channel(PAIRING_CHANNEL, WIFI_SECOND_CHAN_NONE);
+    notifyNodesChannelSwitch(PAIRING_CHANNEL);
+    refreshEspNowPeers();
+
+    tft.fillRect(20, 50, 280, 140, COLOR_DARK_GRAY);
+    tft.drawRect(20, 50, 280, 140, COLOR_RED);
     tft.setTextColor(COLOR_RED);
     tft.setTextSize(2);
-    tft.setCursor(35, 75);
+    tft.setCursor(35, 65);
     tft.print("CONNECTION FAILED");
     tft.setTextColor(COLOR_WHITE);
     tft.setTextSize(1);
-    tft.setCursor(35, 102);
-    tft.print("Check password or router.");
-    tft.setCursor(35, 122);
-    tft.print("Tap screen to return...");
-    delay(1800);
+    tft.setCursor(35, 95);
+    tft.print("Could not connect to router.");
+    tft.setCursor(35, 115);
+    tft.print("Nodes restored to Channel 1.");
+    delay(2200);
+
+    inMenu = true;
+    currentMenuPage = 4;
+    while (tft.getTouch(&tx, &ty)) delay(20);
+    drawMenu();
   }
-  drawMenu();
 }
 
 void drawSlider() {
@@ -1621,13 +1903,18 @@ void drawMenu() {
     }
 
     if (hubSSID.length() > 0) {
-      // Button 1 (y=96..132, h=36): Connect or Reconnect
-      uint16_t btnCol = isConn ? COLOR_BLUE : 0x03E0;
+      // Button 1 (y=96..132, h=36): GitHub Auto-Update (if connected) or Connect
+      uint16_t btnCol = isConn ? 0x79FF : 0x03E0;
       tft.fillRoundRect(8, 96, 304, 36, 5, btnCol);
       tft.setTextColor(COLOR_WHITE);
       tft.setTextSize(2);
-      tft.setCursor(isConn ? 32 : 36, 106);
-      tft.print(isConn ? "RE-CHECK / RECONNECT" : "CONNECT TO SAVED WIFI");
+      if (isConn) {
+        tft.setCursor(44, 106);
+        tft.print("GITHUB AUTO-UPDATE");
+      } else {
+        tft.setCursor(36, 106);
+        tft.print("CONNECT TO SAVED WIFI");
+      }
 
       // Button 2 (y=138..174, h=36): Start Setup AP (New WiFi)
       tft.fillRoundRect(8, 138, 304, 36, 5, COLOR_CYAN);
@@ -1765,8 +2052,11 @@ void handleTouch() {
             else if (startY > 148 && startY < 186) {
               inMenu = false;
               isPairingMode = false;
+              while (tft.getTouch(&x, &y)) delay(20);
               tft.fillScreen(COLOR_BG);
               lastRenderedPage = -1;
+              invalidateCache = true;
+              forceRedraw = true;
               drawDisplay(true);
               forceRedraw = false;
             }
@@ -1891,9 +2181,13 @@ void handleTouch() {
           }
           else if (currentMenuPage == 4) {
             if (hubSSID.length() > 0) {
-              // Button 1: Connect or Reconnect (y=96..134)
+              // Button 1: GitHub Auto-Update (if connected) or Connect (y=96..134)
               if (startY >= 96 && startY <= 134) {
-                connectToSavedWifi();
+                if (WiFi.status() == WL_CONNECTED) {
+                  checkAndPerformGitHubOTA();
+                } else {
+                  connectToSavedWifi();
+                }
               }
               // Button 2: Start Setup AP (y=138..176)
               else if (startY >= 138 && startY <= 176) {
@@ -1912,6 +2206,10 @@ void handleTouch() {
                   hubPASS = "";
                   WiFi.disconnect(true);
                   delay(300);
+                  WiFi.mode(WIFI_STA);
+                  esp_wifi_set_channel(PAIRING_CHANNEL, WIFI_SECOND_CHAN_NONE);
+                  notifyNodesChannelSwitch(PAIRING_CHANNEL);
+                  refreshEspNowPeers();
                   drawMenu();
                 } else {
                   // Back
@@ -1966,12 +2264,65 @@ void handleTouch() {
   }
 }
 
+void notifyNodesChannelSwitch(uint8_t fromChannel, uint8_t newChannel) {
+  if (newChannel == 0 || newChannel > 13) newChannel = PAIRING_CHANNEL;
+  if (fromChannel == 0 || fromChannel > 13) fromChannel = PAIRING_CHANNEL;
+  Serial.printf("[HUB] Broadcasting channel switch: sending on Ch %d -> nodes move to Ch %d (12 packets)...\n", fromChannel, newChannel);
+  
+  esp_wifi_set_channel(fromChannel, WIFI_SECOND_CHAN_NONE);
+  delay(15);
+
+  PairingBeacon b = {};
+  strncpy(b.magic, "WLMSHUB", 8);
+  memcpy(b.hubMAC, myMAC, 6);
+  b.channel = newChannel;
+  b.pairingCode = pairingCode;
+  b.auth = pairAuth((uint8_t*)&b, sizeof(PairingBeacon) - sizeof(b.auth));
+
+  uint8_t broadcast[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+  for (int p = 0; p < 12; p++) {
+    esp_now_send(broadcast, (uint8_t *)&b, sizeof(PairingBeacon));
+    delay(20);
+  }
+}
+
+void notifyNodesChannelSwitch(uint8_t newChannel) {
+  notifyNodesChannelSwitch(PAIRING_CHANNEL, newChannel);
+}
+
+void refreshEspNowPeers() {
+  if (!espNowOk) return;
+  uint8_t broadcast[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+  if (esp_now_is_peer_exist(broadcast)) {
+    esp_now_del_peer(broadcast);
+  }
+  esp_now_peer_info_t bcast = {};
+  memset(bcast.peer_addr, 0xFF, 6);
+  bcast.channel = 0;
+  bcast.ifidx = (WiFi.status() == WL_CONNECTED) ? WIFI_IF_STA : (isAPMode ? WIFI_IF_AP : WIFI_IF_STA);
+  bcast.encrypt = false;
+  esp_now_add_peer(&bcast);
+
+  for (int i = 0; i < MAX_NODES; i++) {
+    if (nodes[i].paired) {
+      if (esp_now_is_peer_exist(nodes[i].mac)) {
+        esp_now_del_peer(nodes[i].mac);
+      }
+      esp_now_peer_info_t peer = {};
+      memcpy(peer.peer_addr, nodes[i].mac, 6);
+      peer.channel = 0;
+      peer.ifidx = (WiFi.status() == WL_CONNECTED) ? WIFI_IF_STA : (isAPMode ? WIFI_IF_AP : WIFI_IF_STA);
+      peer.encrypt = false;
+      esp_now_add_peer(&peer);
+    }
+  }
+}
 
 void broadcastBeacon() {
   PairingBeacon b = {};
   strncpy(b.magic, "WLMSHUB", 8);
   memcpy(b.hubMAC, myMAC, 6);
-  b.channel = PAIRING_CHANNEL;  // always tell node we're on pairing channel
+  b.channel = (WiFi.status() == WL_CONNECTED) ? WiFi.channel() : PAIRING_CHANNEL;
   b.pairingCode = pairingCode;
   b.auth = pairAuth((uint8_t*)&b, sizeof(PairingBeacon) - sizeof(b.auth));
   
@@ -1998,6 +2349,254 @@ void drawOTAProgress(int percent) {
   tft.setTextColor(COLOR_CYAN, COLOR_BG);
   tft.setCursor(130, 160);
   tft.printf("%d%%", percent);
+}
+
+#define CURRENT_FIRMWARE_VERSION "v1.2.0"
+#define GITHUB_REPO "isshin-2/aquapulse"
+
+void checkAndPerformGitHubOTA() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[GITHUB-OTA] Cannot check update: Wi-Fi not connected!");
+    tft.fillScreen(COLOR_BG);
+    tft.setTextColor(COLOR_RED);
+    tft.setTextSize(2);
+    tft.setCursor(20, 80);
+    tft.print("NO WI-FI CONNECTION");
+    tft.setTextSize(1);
+    tft.setTextColor(COLOR_WHITE);
+    tft.setCursor(20, 115);
+    tft.print("Connect Hub to Wi-Fi to use GitHub Auto-Update.");
+    delay(2500);
+    if (inMenu) drawMenu();
+    else drawDisplay(true);
+    return;
+  }
+
+  Serial.println("[GITHUB-OTA] Checking for latest release on GitHub: " GITHUB_REPO);
+  tft.fillScreen(COLOR_BG);
+  tft.setTextColor(COLOR_HEADER);
+  tft.setTextSize(2);
+  tft.setCursor(20, 30);
+  tft.print("GITHUB AUTO-UPDATE");
+  tft.drawFastHLine(0, 58, 320, COLOR_ACCENT);
+
+  tft.setTextSize(1);
+  tft.setTextColor(COLOR_WHITE);
+  tft.setCursor(20, 75);
+  tft.print("Current: ");
+  tft.setTextColor(COLOR_CYAN);
+  tft.print(CURRENT_FIRMWARE_VERSION);
+
+  tft.setTextColor(COLOR_WHITE);
+  tft.setCursor(140, 75);
+  tft.print("Repo: ");
+  tft.setTextColor(COLOR_ACCENT);
+  tft.print(GITHUB_REPO);
+
+  tft.setTextColor(0xFFE0); // Yellow
+  tft.setCursor(20, 110);
+  tft.print("Checking GitHub API for latest release...");
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setTimeout(12000);
+
+  HTTPClient http;
+  http.setUserAgent("ESP32-AquaPulse-Hub");
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  http.setTimeout(12000);
+
+  String apiUrl = "https://api.github.com/repos/" GITHUB_REPO "/releases/latest";
+  http.begin(client, apiUrl);
+  int httpCode = http.GET();
+
+  Serial.printf("[GITHUB-OTA] API HTTP code: %d\n", httpCode);
+
+  if (httpCode == 200) {
+    String payload = http.getString();
+    http.end();
+
+    int tagIdx = payload.indexOf("\"tag_name\":");
+    String latestTag = "";
+    if (tagIdx > 0) {
+      int q1 = payload.indexOf('"', tagIdx + 11);
+      int q2 = payload.indexOf('"', q1 + 1);
+      if (q1 > 0 && q2 > q1) latestTag = payload.substring(q1 + 1, q2);
+    }
+    latestTag.trim();
+
+    String downloadUrl = "";
+    int binIdx = payload.indexOf("firmware.bin");
+    if (binIdx > 0) {
+      int uIdx = payload.lastIndexOf("\"browser_download_url\":", binIdx);
+      if (uIdx > 0) {
+        int q1 = payload.indexOf('"', uIdx + 23);
+        int q2 = payload.indexOf('"', q1 + 1);
+        if (q1 > 0 && q2 > q1) downloadUrl = payload.substring(q1 + 1, q2);
+      }
+    }
+    if (downloadUrl.length() == 0 && latestTag.length() > 0) {
+      downloadUrl = "https://github.com/" GITHUB_REPO "/releases/download/" + latestTag + "/firmware.bin";
+    }
+
+    Serial.printf("[GITHUB-OTA] Latest tag: '%s', Download URL: '%s'\n", latestTag.c_str(), downloadUrl.c_str());
+
+    if (latestTag.length() == 0) {
+      tft.fillRect(20, 105, 280, 80, COLOR_BG);
+      tft.setTextColor(COLOR_ORANGE);
+      tft.setTextSize(2);
+      tft.setCursor(20, 115);
+      tft.print("PARSE ERROR");
+      tft.setTextSize(1);
+      tft.setTextColor(COLOR_WHITE);
+      tft.setCursor(20, 145);
+      tft.print("Could not parse release tag from GitHub.");
+      delay(3000);
+    } else if (latestTag.equalsIgnoreCase(CURRENT_FIRMWARE_VERSION)) {
+      tft.fillRect(20, 105, 280, 80, COLOR_BG);
+      tft.setTextColor(0x07E0); // Bright green
+      tft.setTextSize(2);
+      tft.setCursor(20, 115);
+      tft.print("UP TO DATE!");
+      tft.setTextSize(1);
+      tft.setTextColor(COLOR_WHITE);
+      tft.setCursor(20, 145);
+      tft.print("Already on latest release: " + latestTag);
+      delay(2500);
+    } else {
+      tft.fillRect(20, 105, 280, 80, COLOR_BG);
+      tft.setTextColor(0x07E0);
+      tft.setTextSize(2);
+      tft.setCursor(20, 110);
+      tft.print("NEW RELEASE FOUND!");
+      tft.setTextSize(1);
+      tft.setTextColor(COLOR_WHITE);
+      tft.setCursor(20, 140);
+      tft.print("Found: " + latestTag + "  (Installed: " CURRENT_FIRMWARE_VERSION ")");
+      tft.setCursor(20, 160);
+      tft.setTextColor(COLOR_ACCENT);
+      tft.print("Downloading firmware.bin...");
+      delay(1500);
+
+      tft.fillScreen(COLOR_BG);
+      tft.setTextColor(COLOR_HEADER);
+      tft.setTextSize(2);
+      tft.setCursor(20, 30);
+      tft.print("UPDATING FIRMWARE");
+      tft.drawFastHLine(0, 58, 320, COLOR_ACCENT);
+      tft.setTextSize(1);
+      tft.setTextColor(COLOR_WHITE);
+      tft.setCursor(20, 70);
+      tft.print("Installing GitHub Release: " + latestTag);
+      tft.setTextColor(COLOR_RED);
+      tft.setCursor(20, 90);
+      tft.print("DO NOT POWER OFF THE HUB!");
+
+      http.begin(client, downloadUrl);
+      int dlCode = http.GET();
+      Serial.printf("[GITHUB-OTA] Download HTTP code: %d\n", dlCode);
+
+      if (dlCode == 200) {
+        int totalLen = http.getSize();
+        WiFiClient *stream = http.getStreamPtr();
+        if (Update.begin(totalLen > 0 ? totalLen : UPDATE_SIZE_UNKNOWN)) {
+          size_t written = 0;
+          uint8_t buff[1024];
+          int lastPct = -1;
+          while (http.connected() && (written < totalLen || totalLen <= 0)) {
+            size_t avail = stream->available();
+            if (avail) {
+              int c = stream->readBytes(buff, min(avail, sizeof(buff)));
+              Update.write(buff, c);
+              written += c;
+              int pct = totalLen > 0 ? (int)((written * 100) / totalLen) : 50;
+              pct = constrain(pct, 0, 100);
+              if (pct != lastPct) {
+                lastPct = pct;
+                drawOTAProgress(pct);
+              }
+            }
+            delay(1);
+          }
+          if (Update.end(true)) {
+            Serial.println("[GITHUB-OTA] Flash update completed successfully!");
+            drawOTAProgress(100);
+            tft.fillScreen(COLOR_BG);
+            tft.setTextColor(0x07E0);
+            tft.setTextSize(2);
+            tft.setCursor(20, 80);
+            tft.print("UPDATE SUCCESSFUL!");
+            tft.setTextSize(1);
+            tft.setTextColor(COLOR_WHITE);
+            tft.setCursor(20, 120);
+            tft.print("Rebooting Hub into " + latestTag + "...");
+            delay(2000);
+            ESP.restart();
+          } else {
+            Serial.printf("[GITHUB-OTA] Update error: %d\n", Update.getError());
+            tft.fillRect(20, 110, 280, 80, COLOR_BG);
+            tft.setTextColor(COLOR_RED);
+            tft.setTextSize(2);
+            tft.setCursor(20, 120);
+            tft.print("FLASH WRITE FAILED");
+            delay(3000);
+          }
+        } else {
+          Serial.println("[GITHUB-OTA] Update.begin failed!");
+        }
+      } else {
+        Serial.printf("[GITHUB-OTA] Download failed with HTTP %d\n", dlCode);
+        tft.fillRect(20, 110, 280, 80, COLOR_BG);
+        tft.setTextColor(COLOR_RED);
+        tft.setTextSize(2);
+        tft.setCursor(20, 120);
+        tft.print("DOWNLOAD FAILED");
+        tft.setTextSize(1);
+        tft.setTextColor(COLOR_WHITE);
+        tft.setCursor(20, 150);
+        tft.printf("HTTP Error: %d", dlCode);
+        delay(3000);
+      }
+      http.end();
+    }
+  } else if (httpCode == 404) {
+    http.end();
+    tft.fillRect(20, 105, 280, 80, COLOR_BG);
+    tft.setTextColor(COLOR_ORANGE);
+    tft.setTextSize(2);
+    tft.setCursor(20, 115);
+    tft.print("NO RELEASES FOUND");
+    tft.setTextSize(1);
+    tft.setTextColor(COLOR_WHITE);
+    tft.setCursor(20, 145);
+    tft.print("No GitHub releases published yet.");
+    tft.setCursor(20, 165);
+    tft.setTextColor(COLOR_CYAN);
+    tft.print("Installed version: " CURRENT_FIRMWARE_VERSION);
+    delay(3000);
+  } else {
+    http.end();
+    tft.fillRect(20, 105, 280, 80, COLOR_BG);
+    tft.setTextColor(COLOR_RED);
+    tft.setTextSize(2);
+    tft.setCursor(20, 115);
+    tft.print("CONNECTION FAILED");
+    tft.setTextSize(1);
+    tft.setTextColor(COLOR_WHITE);
+    tft.setCursor(20, 145);
+    tft.printf("GitHub API HTTP Error: %d", httpCode);
+    delay(3000);
+  }
+
+  uint16_t tx, ty;
+  while (tft.getTouch(&tx, &ty)) delay(20);
+  if (inMenu) drawMenu();
+  else {
+    lastRenderedPage = -1;
+    invalidateCache = true;
+    forceRedraw = true;
+    drawDisplay(true);
+  }
 }
 
 String getOTAHTML() {
@@ -2059,6 +2658,7 @@ String getDashboardHTML() {
   html += "<label>Alert Threshold (%):</label><input type='number' name='alert' value='" + String(alertThreshold) + "'>";
   html += "<button type='submit'>Save Calibration</button></form></div>";
   html += "<div class='card'><h3>⚡ Wireless Firmware Update (OTA)</h3><p style='color:#94a3b8;font-size:13px;'>Flash firmware wirelessly over Wi-Fi without a USB cable.</p><a href='/update' style='display:block;text-align:center;padding:12px;background:#0284c7;color:#fff;border-radius:6px;font-weight:bold;text-decoration:none;'>Open Wireless OTA Flasher &rarr;</a></div>";
+  html += "<div class='card'><h3>🌐 GitHub Auto-Update</h3><p style='color:#94a3b8;font-size:13px;'>Check and install the latest firmware directly from GitHub (<b>isshin-2/aquapulse</b>).</p><button type='button' style='background:#7c3aed;color:#fff;border:none;padding:12px;border-radius:6px;font-weight:bold;cursor:pointer;' onclick=\"fetch('/githubupdate').then(()=>alert('GitHub update check triggered on Hub screen!'))\">🚀 Check GitHub for Updates</button></div>";
   html += "<div class='card'><h3>Hardware Diagnostics & Alarm</h3>";
   html += "<button type='button' style='background:#f59e0b;padding:10px 16px;border:none;border-radius:5px;color:white;font-weight:bold;cursor:pointer;' onclick=\"fetch('/testbuzzer').then(()=>alert('Buzzer test triggered!'))\">🔊 Test Hub Buzzer</button>";
   if (buzzerAlert) {
@@ -2099,17 +2699,30 @@ String getAPSetupHTML() {
   pg += ".tip{background:#1e3a5f;border-left:4px solid #38bdf8;padding:8px 12px;border-radius:4px;font-size:12px;color:#cbd5e1;margin-top:16px;line-height:1.4;}";
   pg += "</style></head><body><div class='box'>";
   pg += "<h2>AquaPulse WiFi Setup</h2>";
-  pg += "<p style='color:#94a3b8;font-size:14px;margin-bottom:15px;text-align:center;'>Connect Hub to your 2.4GHz home Wi-Fi network.</p>";
   pg += "<form action='/save' method='POST'>";
+  if (scannedNetworksHTML.length() > 0) {
+    pg += scannedNetworksHTML;
+  }
   pg += "<label>NETWORK NAME (SSID):</label>";
-  pg += "<input id='sInp' name='s' value='" + hubSSID + "' placeholder='Enter your Wi-Fi name' required autofocus>";
+  pg += "<input id='sInp' name='s' value='" + hubSSID + "' placeholder='Select above or enter Wi-Fi name' required autofocus>";
   pg += "<label>WI-FI PASSWORD:</label>";
   pg += "<input name='p' placeholder='Enter Wi-Fi password' type='password'>";
   pg += "<button type='submit' onclick=\"this.innerText='Saving & Connecting...';\">Save & Connect Hub</button>";
   pg += "</form>";
-  pg += "<div class='tip'><b>Note:</b> Please ensure your router broadcasts on 2.4GHz. Once saved, the Hub screen will show its assigned IP address.</div>";
+  pg += "<div class='tip'><b>Note:</b> Connected nodes will automatically synchronize to the selected Wi-Fi channel.</div>";
   pg += "</div></body></html>";
   return pg;
+}
+
+void serveAPPortal() {
+  Serial.printf("[HUB-AP] Serving Setup Portal to client: %s (URI: %s)\n",
+                server.client().remoteIP().toString().c_str(),
+                server.uri().c_str());
+  server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+  server.sendHeader("Pragma", "no-cache");
+  server.sendHeader("Expires", "-1");
+  server.sendHeader("Connection", "close");
+  server.send(200, "text/html; charset=utf-8", getAPSetupHTML());
 }
 
 void setupServerRoutes() {
@@ -2120,13 +2733,7 @@ void setupServerRoutes() {
   // Root endpoint: In AP mode serve setup portal, in STA mode serve dashboard
   server.on("/", HTTP_ANY, []() {
     if (inAPSetup) {
-      Serial.printf("[HUB-AP] Serving Setup Portal to client: %s\n",
-                    server.client().remoteIP().toString().c_str());
-      server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
-      server.sendHeader("Pragma", "no-cache");
-      server.sendHeader("Expires", "-1");
-      server.sendHeader("Connection", "close");
-      server.send(200, "text/html; charset=utf-8", getAPSetupHTML());
+      serveAPPortal();
     } else {
       server.send(200, "text/html", getDashboardHTML());
     }
@@ -2141,48 +2748,38 @@ void setupServerRoutes() {
   server.on("/apple-touch-icon-precomposed.png", HTTP_ANY, handleIcon204);
 
   // Apple Captive Network Assistant probes
-  auto handleAppleProbe = []() {
-    if (inAPSetup) {
-      Serial.println("[HUB-AP] Apple CNA probe -> Serving Setup Portal");
-      server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
-      server.sendHeader("Pragma", "no-cache");
-      server.sendHeader("Expires", "-1");
-      server.sendHeader("Connection", "close");
-      server.send(200, "text/html; charset=utf-8", getAPSetupHTML());
-    } else {
-      server.send(200, "text/html", getDashboardHTML());
-    }
-  };
-  server.on("/hotspot-detect.html", HTTP_ANY, handleAppleProbe);
-  server.on("/canonical.html", HTTP_ANY, handleAppleProbe);
+  server.on("/hotspot-detect.html", HTTP_ANY, []() {
+    if (inAPSetup) serveAPPortal();
+    else server.send(200, "text/html", getDashboardHTML());
+  });
+  server.on("/canonical.html", HTTP_ANY, []() {
+    if (inAPSetup) serveAPPortal();
+    else server.send(200, "text/html", getDashboardHTML());
+  });
 
-  // Android / Chrome Captive Portal probes: 302 Redirect to http://192.168.4.1/
-  auto handleAndroidProbe = []() {
-    if (inAPSetup) {
-      Serial.println("[HUB-AP] Android captive probe -> 302 Redirect to 192.168.4.1");
-      server.sendHeader("Location", "http://192.168.4.1/", true);
-      server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
-      server.sendHeader("Connection", "close");
-      server.send(302, "text/html", "<!DOCTYPE html><html><head><meta http-equiv='refresh' content='0;url=http://192.168.4.1/'></head><body><a href='http://192.168.4.1/'>AquaPulse WiFi Setup</a></body></html>");
-    } else {
-      server.send(204, "text/plain", "");
-    }
-  };
-  server.on("/generate_204", HTTP_ANY, handleAndroidProbe);
-  server.on("/gen_204", HTTP_ANY, handleAndroidProbe);
+  // Android / Chrome Captive Portal probes
+  server.on("/generate_204", HTTP_ANY, []() {
+    if (inAPSetup) serveAPPortal();
+    else server.send(204, "text/plain", "");
+  });
+  server.on("/gen_204", HTTP_ANY, []() {
+    if (inAPSetup) serveAPPortal();
+    else server.send(204, "text/plain", "");
+  });
 
   // Windows probes
   server.on("/ncsi.txt", HTTP_ANY, []() {
     server.send(200, "text/plain", "Microsoft NCSI");
   });
   server.on("/connecttest.txt", HTTP_ANY, []() {
-    if (inAPSetup) {
-      server.sendHeader("Location", "http://192.168.4.1/", true);
-      server.sendHeader("Connection", "close");
-      server.send(302, "text/html", "<meta http-equiv='refresh' content='0;url=http://192.168.4.1/'>");
-    } else {
-      server.send(200, "text/plain", "Microsoft Connect Test");
-    }
+    if (inAPSetup) serveAPPortal();
+    else server.send(200, "text/plain", "Microsoft Connect Test");
+  });
+
+  // Firefox & generic probes
+  server.on("/success.txt", HTTP_ANY, []() {
+    if (inAPSetup) serveAPPortal();
+    else server.send(200, "text/plain", "success\n");
   });
 
   // Save WiFi credentials
@@ -2278,6 +2875,11 @@ void setupServerRoutes() {
     toggleSnooze();
     server.send(200, "text/plain", snoozeActive ? "Buzzer Snoozed for 30m" : "Snooze Cancelled / Unmuted");
   });
+  server.on("/githubupdate", HTTP_ANY, []() {
+    server.send(200, "text/html", "<!DOCTYPE html><html><body style='background:#0f172a;color:#fff;font-family:sans-serif;text-align:center;padding:40px;'><h2>Checking GitHub for Updates...</h2><p>Please look at the Hub screen.</p><p><a href='/' style='color:#38bdf8'>Return to Dashboard</a></p></body></html>");
+    delay(100);
+    checkAndPerformGitHubOTA();
+  });
   server.on("/savecalib", []() {
     if (server.hasArg("empty"))  tankEmptyMm    = constrain(server.arg("empty").toInt(), 100, 5000);
     if (server.hasArg("full"))   tankFullMm     = constrain(server.arg("full").toInt(), 10, tankEmptyMm - 10);
@@ -2292,31 +2894,12 @@ void setupServerRoutes() {
   server.onNotFound([]() {
     if (inAPSetup) {
       String uri = server.uri();
-      Serial.printf("[HUB-AP] onNotFound: Host='%s', URI='%s', Client=%s\n",
-                    server.hostHeader().c_str(), uri.c_str(),
-                    server.client().remoteIP().toString().c_str());
-
       // If it's an image or static asset, return 204
       if (uri.endsWith(".ico") || uri.endsWith(".png") || uri.endsWith(".jpg") || uri.endsWith(".svg")) {
         server.send(204, "text/plain", "");
         return;
       }
-
-      // If external domain request (captive portal redirect needed)
-      String host = server.hostHeader();
-      if (!host.startsWith("192.168.4.1")) {
-        server.sendHeader("Location", "http://192.168.4.1/", true);
-        server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
-        server.sendHeader("Connection", "close");
-        server.send(302, "text/html", "<!DOCTYPE html><html><head><meta http-equiv='refresh' content='0;url=http://192.168.4.1/'></head><body><p>Redirecting to <a href='http://192.168.4.1/'>AquaPulse WiFi Setup</a>...</p></body></html>");
-      } else {
-        // Direct access to 192.168.4.1 with any path -> directly serve setup HTML!
-        server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
-        server.sendHeader("Pragma", "no-cache");
-        server.sendHeader("Expires", "-1");
-        server.sendHeader("Connection", "close");
-        server.send(200, "text/html; charset=utf-8", getAPSetupHTML());
-      }
+      serveAPPortal();
     } else {
       server.send(404, "text/plain", "Not Found");
     }
@@ -2378,13 +2961,20 @@ void updatePage0() {
   static int lastPercent[4] = {-1, -1, -1, -1};
 
   if (invalidateCache) {
-    for (int i=0; i<4; i++) { lastPaired[i] = !nodes[i].paired; }
+    for (int i=0; i<4; i++) {
+      lastPaired[i] = !nodes[i].paired;
+      lastOffline[i] = !nodes[i].paired;
+      lastDist[i] = -999;
+      lastPercent[i] = -999;
+    }
   }
 
   int xs[] = {2, 162, 2, 162};
   int ys[] = {34, 34, 137, 137};
+  int pCount = activeNodeCount();
+  int drawCount = (pCount > 2) ? 4 : 2;
   
-  for (int i=0; i<activeNodeCount(); i++) {
+  for (int i=0; i<drawCount; i++) {
     int x = xs[i], y = ys[i];
     
     bool offline = (millis() - nodes[i].lastRecvTime > 10000);
@@ -2799,38 +3389,9 @@ void setup() {
   tft.setCursor(10, 100);
   tft.setTextColor(COLOR_WHITE);
   
-  bool connected = false;
-  if (hubSSID.length() > 0) {
-    tft.println("Connecting to WiFi:");
-    tft.setTextColor(COLOR_ACCENT);
-    tft.println(hubSSID);
-    
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(hubSSID.c_str(), hubPASS.c_str());
-    unsigned long t = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - t < 10000) {
-      delay(300);
-      tft.print(".");
-    }
-    connected = (WiFi.status() == WL_CONNECTED);
-  }
-  
-  if (connected) {
-    isAPMode = false;
-    tft.println("\nConnected!");
-    tft.print("IP: "); tft.println(WiFi.localIP());
-    delay(800);
-    initWebServerAndOTA();
-  } else {
-    // No WiFi configured – start normally without blocking.
-    // User can set up or connect to WiFi anytime from the menu.
-    isAPMode = false;
-    WiFi.mode(WIFI_STA); // Needed for ESP-NOW on channel
-    esp_wifi_set_channel(PAIRING_CHANNEL, WIFI_SECOND_CHAN_NONE);
-    tft.println("\nNo WiFi - ESP-NOW only");
-    tft.println("(Connect anytime via Menu)");
-    delay(600);
-  }
+  // Initialize ESP-NOW on Station interface first
+  WiFi.mode(WIFI_STA);
+  esp_wifi_set_channel(PAIRING_CHANNEL, WIFI_SECOND_CHAN_NONE);
 
   if (esp_now_init() != ESP_OK) {
     Serial.println("Error initializing ESP-NOW");
@@ -2844,7 +3405,7 @@ void setup() {
     esp_now_peer_info_t bcast = {};
     memset(bcast.peer_addr, 0xFF, 6);
     bcast.channel = 0;
-    bcast.ifidx = isAPMode ? WIFI_IF_AP : WIFI_IF_STA;
+    bcast.ifidx = WIFI_IF_STA;
     bcast.encrypt = false;
     esp_now_add_peer(&bcast);
 
@@ -2855,12 +3416,66 @@ void setup() {
       if (nodes[i].paired) {
         esp_now_peer_info_t peer = {};
         memcpy(peer.peer_addr, nodes[i].mac, 6);
-        peer.channel = 0; // Use current channel
-        peer.ifidx = isAPMode ? WIFI_IF_AP : WIFI_IF_STA;
+        peer.channel = 0;
+        peer.ifidx = WIFI_IF_STA;
         peer.encrypt = false;
         esp_now_add_peer(&peer);
       }
     }
+  }
+
+  bool connected = false;
+  if (hubSSID.length() > 0) {
+    tft.println("Connecting to WiFi:");
+    tft.setTextColor(COLOR_ACCENT);
+    tft.println(hubSSID);
+    
+    // Find router channel and notify nodes on Channel 1 before switching
+    uint8_t targetChannel = PAIRING_CHANNEL;
+    int sn = WiFi.scanNetworks(false, false, false, 250);
+    for (int i = 0; i < sn; i++) {
+      if (WiFi.SSID(i).equals(hubSSID)) {
+        targetChannel = WiFi.channel(i);
+        break;
+      }
+    }
+    esp_wifi_set_channel(PAIRING_CHANNEL, WIFI_SECOND_CHAN_NONE);
+    delay(20);
+    if (targetChannel != PAIRING_CHANNEL) {
+      notifyNodesChannelSwitch(PAIRING_CHANNEL, targetChannel);
+      delay(100);
+    }
+
+    WiFi.begin(hubSSID.c_str(), hubPASS.c_str());
+    unsigned long t = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - t < 10000) {
+      delay(300);
+      tft.print(".");
+    }
+    connected = (WiFi.status() == WL_CONNECTED);
+  }
+  
+  if (connected) {
+    isAPMode = false;
+    WiFi.setSleep(false);
+    esp_wifi_set_ps(WIFI_PS_NONE);
+    refreshEspNowPeers();
+    tft.println("\nConnected!");
+    char ipChBuf[32];
+    sprintf(ipChBuf, "IP: %s (Ch %d)", WiFi.localIP().toString().c_str(), WiFi.channel());
+    tft.println(ipChBuf);
+    delay(800);
+    initWebServerAndOTA();
+    startupBeaconActive = true;
+    startupBeaconStart = millis();
+    lastStartupBeacon = 0;
+  } else {
+    isAPMode = false;
+    esp_wifi_set_channel(PAIRING_CHANNEL, WIFI_SECOND_CHAN_NONE);
+    refreshEspNowPeers();
+    tft.println("\nNo WiFi - ESP-NOW only");
+    tft.println("(Connect anytime via Menu)");
+    delay(600);
   }
 
   drawHeader();
@@ -2895,12 +3510,36 @@ void loop() {
     } else if (cmd.equalsIgnoreCase("d") || cmd.equalsIgnoreCase("dismiss") || cmd.equalsIgnoreCase("mute") || cmd.equalsIgnoreCase("snooze") || cmd.equalsIgnoreCase("snz")) {
       toggleSnooze();
     } else if (cmd.equalsIgnoreCase("wifi") || cmd.equalsIgnoreCase("wifistatus")) {
-      Serial.printf("[HUB] WiFi Status: %s, SSID: '%s', IP: %s, RSSI: %d dBm\n",
+      Serial.printf("[HUB] WiFi Status: %s, SSID: '%s', IP: %s, Ch: %d, RSSI: %d dBm\n",
                     (WiFi.status() == WL_CONNECTED) ? "CONNECTED" : "DISCONNECTED",
-                    hubSSID.c_str(), WiFi.localIP().toString().c_str(), WiFi.RSSI());
+                    hubSSID.c_str(), WiFi.localIP().toString().c_str(), WiFi.channel(), WiFi.RSSI());
+    } else if (cmd.equalsIgnoreCase("wifi disconnect") || cmd.equalsIgnoreCase("wifioff") || cmd.equalsIgnoreCase("disconnect")) {
+      uint8_t oldCh = (WiFi.status() == WL_CONNECTED) ? WiFi.channel() : PAIRING_CHANNEL;
+      WiFi.disconnect(true);
+      WiFi.mode(WIFI_STA);
+      esp_wifi_set_channel(PAIRING_CHANNEL, WIFI_SECOND_CHAN_NONE);
+      notifyNodesChannelSwitch(oldCh, PAIRING_CHANNEL);
+      notifyNodesChannelSwitch(PAIRING_CHANNEL, PAIRING_CHANNEL);
+      refreshEspNowPeers();
+      Serial.println("[HUB] WiFi disconnected. Reverted to Channel 1 (ESP-NOW only).");
+    } else if (cmd.equalsIgnoreCase("nodes") || cmd.equalsIgnoreCase("status")) {
+      Serial.printf("[HUB] WiFi: %s, SSID: '%s', IP: %s, Ch: %d, RSSI: %d dBm\n",
+                    (WiFi.status() == WL_CONNECTED) ? "CONNECTED" : "DISCONNECTED",
+                    hubSSID.c_str(), WiFi.localIP().toString().c_str(), WiFi.channel(), WiFi.RSSI());
+      for (int i = 0; i < MAX_NODES; i++) {
+        unsigned long ago = nodes[i].lastRecvTime > 0 ? (millis() - nodes[i].lastRecvTime) / 1000 : 9999;
+        Serial.printf("[HUB] Node %d: Paired=%d, MAC=%02X:%02X:%02X:%02X:%02X:%02X, Dist=%d mm, LastSeen=%lus ago\n",
+                      i+1, nodes[i].paired,
+                      nodes[i].mac[0], nodes[i].mac[1], nodes[i].mac[2],
+                      nodes[i].mac[3], nodes[i].mac[4], nodes[i].mac[5],
+                      nodes[i].distance, ago);
+      }
     } else if (cmd.equalsIgnoreCase("wifi connect") || cmd.equalsIgnoreCase("wificonnect")) {
       Serial.println("[HUB] Connecting to saved WiFi...");
       connectToSavedWifi();
+    } else if (cmd.equalsIgnoreCase("update") || cmd.equalsIgnoreCase("github") || cmd.equalsIgnoreCase("githubupdate") || cmd.equalsIgnoreCase("checkupdate")) {
+      Serial.println("[HUB] Starting GitHub Auto-Update check...");
+      checkAndPerformGitHubOTA();
     } else if (cmd.equalsIgnoreCase("wifi setup") || cmd.equalsIgnoreCase("wifisetup") || cmd.equalsIgnoreCase("ap")) {
       Serial.println("[HUB] Starting WiFi setup AP...");
       startWifiAP();
@@ -2965,6 +3604,13 @@ void loop() {
       startupBeaconActive = false;
       Serial.println("[HUB] Startup beacon window closed");
     }
+  }
+
+  // Periodic beacon broadcast every 5s so nodes always stay synchronized with Hub's active channel
+  static unsigned long lastPeriodicSyncBeacon = 0;
+  if (millis() - lastPeriodicSyncBeacon > 5000) {
+    lastPeriodicSyncBeacon = millis();
+    broadcastBeacon();
   }
 
   if (inMenu) {
